@@ -12,7 +12,8 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 
 ## 状态
 
-已实现：快照权重、逐跳委托解析、受托人权重合并、计票、独立复核与 CLI。
+已实现：快照权重、逐跳委托解析、受托人权重合并、计票、独立复核与 CLI；
+以及提案级委托覆盖（`delegation_override`）：已委托账户可以本人权重亲自投票。
 
 ## 安装与运行
 
@@ -33,7 +34,7 @@ cat proposal.json | python3 gov_tally.py
 | --- | --- | --- |
 | `proposal_id` | string | 提案标识 |
 | `choices` | string[] | 非空、不重复的选项列表（输出顺序以此为准） |
-| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string） |
+| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string），可选 `delegation_override`（bool） |
 | `snapshot` | object | account -> 非负整数权重 |
 | `delegations` | object | account -> account，逐跳指向受托人 |
 
@@ -45,6 +46,15 @@ cat proposal.json | python3 gov_tally.py
 - 最终受托人未投票时，其所持全部权重归入未计票。
 - 委托链成环且无法到达最终受托人时报错（自环不算环）。
 
+委托覆盖（`delegation_override`）：
+
+- 省略或为 `false`：保持上述规则，普通票只能由最终受托人发出。
+- 为 `true`：要求 voter 在 snapshot 中且委托链指向他人；该 voter 的本人权重按其
+  `choice` 计入，不再传递给最终受托人；链上其他账户的权重仍归最终受托人。
+  每个 voter（含覆盖投票者）全程只可出现一次。
+- `delegation_override` 不是布尔值时报 `InvalidInputError`；覆盖投票者不在
+  snapshot、或未委托他人（含自委托）时报 `InvalidVoteError`。
+
 ## 输出格式
 
 `per_choice` 的键顺序与输入 `choices` 完全一致；所有权重与汇总均为整数。
@@ -53,7 +63,7 @@ cat proposal.json | python3 gov_tally.py
 | --- | --- |
 | `proposal_id` | 与输入一致 |
 | `per_choice` | 各选项按 choices 同序排列的计入权重 |
-| `effective_weights` | 实际计入的投票受托人 -> 合并后权重（按投票顺序） |
+| `effective_weights` | 实际计入的投票账户 -> 权重（按投票顺序）：覆盖票记本人权重，受托人记剩余合并权重 |
 | `uncounted_weight` | 未计票权重（弃权/未投票受托人所持权重） |
 | `counted_weight` | 已计票权重 |
 | `snapshot_total_weight` | 快照权重总和 |
@@ -94,10 +104,10 @@ verify_tally(input_data, result)  # 一致返回 True，否则抛 TallyVerificat
 
 | 异常类 | 触发条件 |
 | --- | --- |
-| `InvalidInputError` | 字段缺失、类型错误、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
+| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
 | `InvalidDelegationError` | `delegations` 的委托方或受托方不在 `snapshot` 中 |
 | `DelegationCycleError` | 委托链成环且无法到达最终受托人 |
-| `InvalidVoteError` | voter 重复、已委托他人者投票、voter 不在 snapshot、choice 不在 choices |
+| `InvalidVoteError` | voter 重复、已委托他人者普通投票、覆盖投票者未委托他人、voter 不在 snapshot、choice 不在 choices |
 | `TallyVerificationError` | `verify_tally` 复核不一致 |
 
 错误输出中的 `message` 为确定性文本，不含内存地址。

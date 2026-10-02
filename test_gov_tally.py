@@ -155,6 +155,150 @@ class TallyTests(unittest.TestCase):
         self.assertEqual(result["winners"], ["no"])
 
 
+class DelegationOverrideTests(unittest.TestCase):
+    def test_override_counts_own_weight_only(self):
+        # a -> b -> c；b 覆盖投票：b 的本人权重 3 记 no，c 仍得 a 的 2 + 本人 4。
+        data = base_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[
+                {"voter": "b", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["per_choice"], {"yes": 6, "no": 3})
+        self.assertEqual(result["effective_weights"], {"b": 3, "c": 6})
+        self.assertEqual(result["counted_weight"], 9)
+        self.assertEqual(result["uncounted_weight"], 0)
+        self.assertEqual(result["winners"], ["yes"])
+        self.assertFalse(result["is_tie"])
+
+    def test_override_weight_not_passed_to_trustee(self):
+        data = base_input(
+            snapshot={"a": 5, "b": 1},
+            delegations={"a": "b"},
+            votes=[{"voter": "a", "choice": "yes", "delegation_override": True}],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["effective_weights"], {"a": 5})
+        self.assertEqual(result["per_choice"], {"yes": 5, "no": 0})
+        # b 未投票，只剩本人权重 1 未计。
+        self.assertEqual(result["uncounted_weight"], 1)
+        self.assertEqual(result["counted_weight"], 5)
+
+    def test_override_false_keeps_baseline_behavior(self):
+        data = base_input(
+            delegations={"a": "b"},
+            votes=[
+                {"voter": "a", "choice": "yes", "delegation_override": False},
+            ],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal(data)
+        data["votes"] = [{"voter": "b", "choice": "yes", "delegation_override": False}]
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["effective_weights"], {"b": 15})
+
+    def test_override_non_boolean_rejected(self):
+        for bad in (1, "true", None, 0):
+            data = base_input(
+                delegations={"a": "b"},
+                votes=[{"voter": "a", "choice": "yes", "delegation_override": bad}],
+            )
+            with self.subTest(bad=bad):
+                with self.assertRaises(gt.InvalidInputError):
+                    gt.tally_proposal(data)
+
+    def test_override_voter_outside_snapshot(self):
+        data = base_input(
+            votes=[{"voter": "z", "choice": "yes", "delegation_override": True}],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal(data)
+
+    def test_override_without_delegation_rejected(self):
+        # 未委托他人（含自委托）者不得使用覆盖投票。
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes", "delegation_override": True}],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal(data)
+        data = base_input(
+            delegations={"a": "a"},
+            votes=[{"voter": "a", "choice": "yes", "delegation_override": True}],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal(data)
+
+    def test_override_duplicate_voter_rejected(self):
+        data = base_input(
+            snapshot={"a": 2, "b": 3},
+            delegations={"a": "b"},
+            votes=[
+                {"voter": "a", "choice": "yes", "delegation_override": True},
+                {"voter": "a", "choice": "no", "delegation_override": True},
+            ],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal(data)
+
+    def test_override_choice_out_of_range(self):
+        data = base_input(
+            delegations={"a": "b"},
+            votes=[{"voter": "a", "choice": "maybe", "delegation_override": True}],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal(data)
+
+    def test_override_and_trustee_both_vote(self):
+        # 覆盖者与最终受托人可各自投一次；受托人只记剩余合并权重。
+        data = base_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "c", "b": "c"},
+            votes=[
+                {"voter": "c", "choice": "yes"},
+                {"voter": "a", "choice": "no", "delegation_override": True},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        # effective_weights 按 votes 顺序；c 得 4 + b 的 3，a 记本人 2。
+        self.assertEqual(list(result["effective_weights"].items()), [("c", 7), ("a", 2)])
+        self.assertEqual(result["per_choice"], {"yes": 7, "no": 2})
+        self.assertEqual(result["counted_weight"], 9)
+        self.assertEqual(result["uncounted_weight"], 0)
+
+    def test_override_chain_intermediate_weight_still_flows(self):
+        # x -> a -> b，a 覆盖投票：x 的权重仍流向 b，a 只取回本人权重。
+        data = base_input(
+            snapshot={"x": 5, "a": 2, "b": 1},
+            delegations={"x": "a", "a": "b"},
+            votes=[
+                {"voter": "a", "choice": "no", "delegation_override": True},
+                {"voter": "b", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["effective_weights"], {"a": 2, "b": 6})
+        self.assertEqual(result["per_choice"], {"yes": 6, "no": 2})
+
+    def test_verify_tally_with_override(self):
+        data = base_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[
+                {"voter": "b", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        self.assertTrue(gt.verify_tally(data, result))
+        bad = json.loads(json.dumps(result))
+        bad["effective_weights"] = {"b": 3, "c": 9}
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally(data, bad)
+
+
 class CycleTests(unittest.TestCase):
     def test_direct_cycle(self):
         data = base_input(snapshot={"a": 1, "b": 2}, delegations={"a": "b", "b": "a"})
@@ -405,6 +549,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         out = json.loads(proc.stdout)
         self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_override_non_boolean_via_cli(self):
+        code, out, _ = self.run_cli(base_input(
+            delegations={"a": "b"},
+            votes=[{"voter": "a", "choice": "yes", "delegation_override": 1}],
+        ))
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_override_success_via_cli(self):
+        code, out, _ = self.run_cli(base_input(
+            delegations={"a": "b"},
+            votes=[{"voter": "a", "choice": "yes", "delegation_override": True}],
+        ))
+        self.assertEqual(code, 0)
+        self.assertEqual(out["effective_weights"], {"a": 10})
+        self.assertEqual(out["uncounted_weight"], 5)
 
     def test_error_messages_are_stable(self):
         # 同一错误两次运行，message 一致且不含对象地址。
