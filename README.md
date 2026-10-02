@@ -12,7 +12,7 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 
 ## 状态
 
-已实现：快照权重、逐跳委托解析、受托人权重合并、计票、独立复核与 CLI。
+已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核与 CLI。
 
 ## 安装与运行
 
@@ -33,17 +33,27 @@ cat proposal.json | python3 gov_tally.py
 | --- | --- | --- |
 | `proposal_id` | string | 提案标识 |
 | `choices` | string[] | 非空、不重复的选项列表（输出顺序以此为准） |
-| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string） |
+| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string）与可选布尔 `delegation_override` |
 | `snapshot` | object | account -> 非负整数权重 |
 | `delegations` | object | account -> account，逐跳指向受托人 |
 
 委托规则：
 
 - 委托逐跳解析到最终受托人；自委托（`A -> A`）与无委托者视为委托终止于本人，可投票。
-- 委托链上的中间委托人（最终受托人不是本人）不可投票，其权重传递给最终受托人。
+- 委托链上的中间委托人（最终受托人不是本人）不可投普通票，其权重传递给最终受托人。
 - 最终受托人合并本人权重与全部传递权重；每个账户的快照权重只并入一次，不重复计数。
 - 最终受托人未投票时，其所持全部权重归入未计票。
 - 委托链成环且无法到达最终受托人时报错（自环不算环）。
+
+委托覆盖（`delegation_override`）：
+
+- 省略或为 `false`：保持普通票语义，普通票只由最终受托人发出。
+- 为 `true`：已委托账户可亲自投票，其**本人权重**按所选 `choice` 计入，且不再传给最终受托人；
+  其上游经其转发的他人权重仍逐跳归入最终受托人，受托人投票时只记扣除后的剩余合并权重。
+- 覆盖票仅可由委托链指向他人（最终受托人不是本人）的账户投出，且同一 voter 只能出现一次。
+- 无论受托人票与覆盖票在 `votes` 中的先后顺序如何，扣除都生效，本人权重不会重复计入。
+- `delegation_override` 取值非布尔（如字符串 `"true"`、数字 `1`）报 `InvalidInputError`；
+  覆盖投票者不在 snapshot 或未委托他人、普通投票者已委托他人、voter 重复、choice 越界，报 `InvalidVoteError`。
 
 ## 输出格式
 
@@ -53,7 +63,7 @@ cat proposal.json | python3 gov_tally.py
 | --- | --- |
 | `proposal_id` | 与输入一致 |
 | `per_choice` | 各选项按 choices 同序排列的计入权重 |
-| `effective_weights` | 实际计入的投票受托人 -> 合并后权重（按投票顺序） |
+| `effective_weights` | 实际计票 voter -> 权重，按 `votes` 顺序；覆盖票记本人权重，受托人票记扣除覆盖权重后的剩余合并权重 |
 | `uncounted_weight` | 未计票权重（弃权/未投票受托人所持权重） |
 | `counted_weight` | 已计票权重 |
 | `snapshot_total_weight` | 快照权重总和 |
@@ -86,18 +96,18 @@ result = tally_proposal(input_data)
 verify_tally(input_data, result)  # 一致返回 True，否则抛 TallyVerificationError
 ```
 
-`verify_tally` 独立重算并逐字段复核：字段完整性、`per_choice` 选项与顺序、
-权重归属（受托人合并、选票归属）、守恒关系与汇总，以及 `winners` / `is_tie`；
-不会只比较 winners。
+`verify_tally` 按覆盖语义独立重算并逐字段复核：字段完整性、`per_choice` 选项与顺序、
+权重归属（覆盖票本人权重、受托人剩余合并权重、选票归属）、守恒关系与汇总，以及
+`winners` / `is_tie`；不会只比较 winners。
 
 ## 异常
 
 | 异常类 | 触发条件 |
 | --- | --- |
-| `InvalidInputError` | 字段缺失、类型错误、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
+| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
 | `InvalidDelegationError` | `delegations` 的委托方或受托方不在 `snapshot` 中 |
 | `DelegationCycleError` | 委托链成环且无法到达最终受托人 |
-| `InvalidVoteError` | voter 重复、已委托他人者投票、voter 不在 snapshot、choice 不在 choices |
+| `InvalidVoteError` | voter 重复、普通票来自已委托他人者、覆盖票来自未委托他人者、voter 不在 snapshot、choice 不在 choices |
 | `TallyVerificationError` | `verify_tally` 复核不一致 |
 
 错误输出中的 `message` 为确定性文本，不含内存地址。

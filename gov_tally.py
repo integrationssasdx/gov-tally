@@ -3,7 +3,8 @@
 仅使用 Python 3.12 标准库，实现：
 
 * 快照权重（snapshot）与逐跳委托（delegations）解析；
-* ``tally_proposal``：合并最终受托人权重并计票；
+* ``tally_proposal``：合并最终受托人权重并计票，支持提案级委托覆盖
+  （``delegation_override``：已委托者亲自投出本人权重，且不重复计入受托人）；
 * ``verify_tally``：独立复核字段、归属、守恒与汇总；
 * 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2。
 """
@@ -54,7 +55,8 @@ class DelegationCycleError(TallyError):
 
 
 class InvalidVoteError(TallyError):
-    """选票非法：重复 voter、已委托他人者投票、voter 不在 snapshot、choice 不存在。"""
+    """选票非法：重复 voter、普通票来自已委托他人者、覆盖票来自未委托他人者、
+    voter 不在 snapshot、choice 不存在。"""
 
 
 class TallyVerificationError(TallyError):
@@ -105,6 +107,12 @@ def _validate_input(data: Any):
             raise InvalidInputError(f"votes[{index}].voter must be a string")
         if not isinstance(vote["choice"], str):
             raise InvalidInputError(f"votes[{index}].choice must be a string")
+        if "delegation_override" in vote and not isinstance(
+            vote["delegation_override"], bool
+        ):
+            raise InvalidInputError(
+                f"votes[{index}].delegation_override must be a boolean"
+            )
 
     snapshot = data["snapshot"]
     if not isinstance(snapshot, dict):
@@ -187,28 +195,50 @@ def _compute(data: Any) -> dict:
     for account, weight in snapshot.items():
         bucket[trustee_of[account]] += weight
 
+    # 覆盖票预先抽出本人权重：无论选票顺序如何，受托人计票时都只拿剩余合并权重，
+    # 保证本人权重不会同时计入覆盖票与受托人票。
+    withdrawn_total = {account: 0 for account in snapshot}
+    for vote in votes:
+        if not vote.get("delegation_override", False):
+            continue
+        voter = vote["voter"]
+        if voter in snapshot and trustee_of[voter] != voter:
+            withdrawn_total[trustee_of[voter]] += snapshot[voter]
+
     choice_set = set(choices)
     per_choice = {choice: 0 for choice in choices}
     effective_weights: dict[str, int] = {}
     seen_voters: set[str] = set()
 
-    for index, vote in enumerate(votes):
+    for vote in votes:
         voter = vote["voter"]
         choice = vote["choice"]
+        override = vote.get("delegation_override", False)
 
         if voter not in snapshot:
             raise InvalidVoteError(f"voter not in snapshot: {voter!r}")
         if choice not in choice_set:
             raise InvalidVoteError(f"choice not in choices: {choice!r}")
-        if trustee_of[voter] != voter:
-            raise InvalidVoteError(
-                f"voter has delegated to another account: {voter!r}"
-            )
         if voter in seen_voters:
             raise InvalidVoteError(f"duplicate voter: {voter!r}")
         seen_voters.add(voter)
 
-        weight = bucket[voter]
+        trustee = trustee_of[voter]
+        if override:
+            # 覆盖票只允许委托链指向他人的账户投出；记本人权重，不传给受托人。
+            if trustee == voter:
+                raise InvalidVoteError(
+                    f"override voter has not delegated to another account: {voter!r}"
+                )
+            weight = snapshot[voter]
+        else:
+            # 普通票只由最终受托人发出；所持权重已扣除被覆盖票抽走的部分。
+            if trustee != voter:
+                raise InvalidVoteError(
+                    f"voter has delegated to another account: {voter!r}"
+                )
+            weight = bucket[voter] - withdrawn_total[voter]
+
         per_choice[choice] += weight
         effective_weights[voter] = weight
 
@@ -237,7 +267,8 @@ def tally_proposal(input_data: dict) -> dict:
 def verify_tally(input_data: dict, result: Any) -> bool:
     """独立复核计票结果。
 
-    检查字段完整性、choice 顺序、权重归属（受托人合并与选票归属）、
+    按覆盖语义独立重算，检查字段完整性、choice 顺序、权重归属
+    （覆盖票记本人权重、受托人记剩余合并权重、选票归属）、
     权重守恒（counted + uncounted == snapshot_total）与汇总一致性。
     全部一致返回 True，否则抛 TallyVerificationError。
     """
