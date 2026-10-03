@@ -1100,5 +1100,479 @@ class CliProvenanceTests(unittest.TestCase):
         self.assertIsInstance(out["message"], str)
 
 
+class DecisionRulesTests(unittest.TestCase):
+    def rules(self, **overrides):
+        rules = {
+            "approval_choices": ["yes"],
+            "min_counted_weight": 1,
+            "approval_basis_points": 5000,
+        }
+        rules.update(overrides)
+        return rules
+
+    def test_omitted_keeps_output_shape(self):
+        data = base_input(votes=[{"voter": "a", "choice": "yes"}])
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            list(result.keys()),
+            [
+                "proposal_id", "per_choice", "effective_weights",
+                "uncounted_weight", "counted_weight",
+                "snapshot_total_weight", "winners", "is_tie",
+            ],
+        )
+        for field in ("quorum_met", "approval_met", "decision"):
+            self.assertNotIn(field, result)
+
+    def test_fields_appended_after_existing_fields(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules=self.rules(min_counted_weight=15),
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            list(result.keys())[-3:],
+            ["quorum_met", "approval_met", "decision"],
+        )
+
+    def test_fields_appended_after_provenance_as_well(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}],
+            decision_rules=self.rules(),
+            include_provenance=True,
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            list(result.keys()),
+            [
+                "proposal_id", "per_choice", "effective_weights",
+                "weight_provenance", "uncounted_weight", "counted_weight",
+                "snapshot_total_weight", "winners", "is_tie",
+                "quorum_met", "approval_met", "decision",
+            ],
+        )
+
+    def test_approved(self):
+        # yes 10 / no 5，counted 15，门槛 15，赞成率 10/15 ≈ 6667bps。
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules=self.rules(min_counted_weight=15, approval_basis_points=6000),
+        )
+        result = gt.tally_proposal(data)
+        self.assertTrue(result["quorum_met"])
+        self.assertTrue(result["approval_met"])
+        self.assertEqual(result["decision"], "approved")
+
+    def test_rejected_when_approval_below_basis(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules=self.rules(min_counted_weight=15, approval_basis_points=7000),
+        )
+        result = gt.tally_proposal(data)
+        self.assertTrue(result["quorum_met"])
+        self.assertFalse(result["approval_met"])
+        self.assertEqual(result["decision"], "rejected")
+
+    def test_no_quorum_below_min(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}],
+            decision_rules=self.rules(min_counted_weight=11),
+        )
+        result = gt.tally_proposal(data)
+        self.assertFalse(result["quorum_met"])
+        # 即使赞成比例足够，未达法定人数优先判 no_quorum。
+        self.assertTrue(result["approval_met"])
+        self.assertEqual(result["decision"], "no_quorum")
+
+    def test_zero_counted_is_never_quorum_even_min_zero(self):
+        data = base_input(decision_rules=self.rules(min_counted_weight=0))
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["counted_weight"], 0)
+        self.assertFalse(result["quorum_met"])
+        # 0*10000 >= 0*bps 成立，approval_met 按规则为真，
+        # 但 quorum 优先，decision 仍为 no_quorum。
+        self.assertTrue(result["approval_met"])
+        self.assertEqual(result["decision"], "no_quorum")
+
+    def test_quorum_boundary_is_inclusive(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules=self.rules(min_counted_weight=15),
+        )
+        result = gt.tally_proposal(data)
+        self.assertTrue(result["quorum_met"])
+
+    def test_approval_boundary_is_inclusive(self):
+        data = base_input(
+            snapshot={"a": 5, "b": 5},
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules=self.rules(approval_basis_points=5000),
+        )
+        result = gt.tally_proposal(data)
+        # 5*10000 == 10*5000：恰好相等算通过。
+        self.assertTrue(result["approval_met"])
+        self.assertEqual(result["decision"], "approved")
+
+        data["decision_rules"] = self.rules(approval_basis_points=5001)
+        result = gt.tally_proposal(data)
+        self.assertFalse(result["approval_met"])
+        self.assertEqual(result["decision"], "rejected")
+
+    def test_basis_points_extremes(self):
+        votes = [
+            {"voter": "a", "choice": "yes"},
+            {"voter": "b", "choice": "no"},
+        ]
+        # 1 bps：有任意赞成权重即通过。
+        data = base_input(
+            votes=votes,
+            decision_rules=self.rules(
+                min_counted_weight=15, approval_basis_points=1
+            ),
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["decision"], "approved")
+
+        # 10000 bps：全部计票权重都在赞成选项上才通过。
+        all_yes = base_input(
+            votes=[{"voter": "a", "choice": "yes"}],
+            decision_rules=self.rules(
+                min_counted_weight=10, approval_basis_points=10000
+            ),
+        )
+        self.assertEqual(gt.tally_proposal(all_yes)["decision"], "approved")
+        mixed = base_input(
+            votes=votes,
+            decision_rules=self.rules(
+                min_counted_weight=15, approval_basis_points=10000
+            ),
+        )
+        self.assertEqual(gt.tally_proposal(mixed)["decision"], "rejected")
+
+    def test_approval_choices_subset_sums_members(self):
+        data = base_input(
+            choices=["yes", "no", "abstain"],
+            snapshot={"a": 6, "b": 2, "c": 1},
+            votes=[
+                {"voter": "a", "choice": "yes"},
+                {"voter": "b", "choice": "no"},
+                {"voter": "c", "choice": "abstain"},
+            ],
+            decision_rules=self.rules(
+                approval_choices=["yes", "abstain"],
+                min_counted_weight=9,
+                approval_basis_points=7777,
+            ),
+        )
+        result = gt.tally_proposal(data)
+        # 赞成权重 7/9 ≈ 7778bps：7777 通过。
+        self.assertTrue(result["approval_met"])
+        self.assertEqual(result["decision"], "approved")
+        data["decision_rules"]["approval_basis_points"] = 7778
+        result = gt.tally_proposal(data)
+        self.assertFalse(result["approval_met"])
+        self.assertEqual(result["decision"], "rejected")
+
+    def test_thresholds_apply_to_merged_delegated_weights(self):
+        data = base_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+            decision_rules=self.rules(min_counted_weight=9),
+        )
+        result = gt.tally_proposal(data)
+        self.assertTrue(result["quorum_met"])
+        self.assertEqual(result["decision"], "approved")
+
+    def test_threshold_fields_are_booleans_and_string(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}],
+            decision_rules=self.rules(),
+        )
+        result = gt.tally_proposal(data)
+        self.assertIsInstance(result["quorum_met"], bool)
+        self.assertIsInstance(result["approval_met"], bool)
+        self.assertIsInstance(result["decision"], str)
+
+
+class InvalidDecisionRulesTests(unittest.TestCase):
+    def rules(self, **overrides):
+        rules = {
+            "approval_choices": ["yes"],
+            "min_counted_weight": 1,
+            "approval_basis_points": 5000,
+        }
+        rules.update(overrides)
+        return rules
+
+    def assert_invalid(self, rules):
+        data = base_input(votes=[{"voter": "a", "choice": "yes"}])
+        data["decision_rules"] = rules
+        with self.assertRaises(gt.InvalidInputError):
+            gt.tally_proposal(data)
+
+    def test_rules_not_an_object(self):
+        for value in ([], "x", 5, None, True):
+            with self.subTest(value=value):
+                self.assert_invalid(value)
+
+    def test_missing_field(self):
+        for field in (
+            "approval_choices",
+            "min_counted_weight",
+            "approval_basis_points",
+        ):
+            rules = self.rules()
+            del rules[field]
+            self.assert_invalid(rules)
+
+    def test_extra_field(self):
+        self.assert_invalid(self.rules(extra=1))
+        self.assert_invalid(self.rules(quorum_met=True))
+
+    def test_bad_approval_choices(self):
+        self.assert_invalid(self.rules(approval_choices="yes"))
+        self.assert_invalid(self.rules(approval_choices=[]))
+        self.assert_invalid(self.rules(approval_choices=[1]))
+        self.assert_invalid(self.rules(approval_choices=[True]))
+        self.assert_invalid(self.rules(approval_choices=["nope"]))
+        self.assert_invalid(self.rules(approval_choices=["yes", "yes"]))
+
+    def test_bad_min_counted_weight(self):
+        for value in (True, False, 1.5, "1", None, -1):
+            with self.subTest(value=value):
+                self.assert_invalid(self.rules(min_counted_weight=value))
+
+    def test_bad_approval_basis_points(self):
+        for value in (True, False, 1.0, "1", None, 0, -1, 10001):
+            with self.subTest(value=value):
+                self.assert_invalid(self.rules(approval_basis_points=value))
+
+    def test_boundary_values_accepted(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}],
+            decision_rules=self.rules(
+                min_counted_weight=0, approval_basis_points=1
+            ),
+        )
+        self.assertEqual(gt.tally_proposal(data)["decision"], "approved")
+        data["decision_rules"]["approval_basis_points"] = 10000
+        self.assertEqual(gt.tally_proposal(data)["decision"], "approved")
+
+    def test_verify_invalid_rules_raise_input_error(self):
+        data = base_input(decision_rules=self.rules(approval_basis_points=0))
+        with self.assertRaises(gt.InvalidInputError):
+            gt.verify_tally(data, {})
+
+
+class VerifyDecisionRulesTests(unittest.TestCase):
+    def setUp(self):
+        self.data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 15,
+                "approval_basis_points": 6000,
+            },
+        )
+        self.result = gt.tally_proposal(self.data)
+
+    def test_verify_passes(self):
+        self.assertTrue(gt.verify_tally(self.data, self.result))
+        self.assertEqual(
+            (
+                self.result["quorum_met"],
+                self.result["approval_met"],
+                self.result["decision"],
+            ),
+            (True, True, "approved"),
+        )
+
+    def test_verify_handcrafted_decision_result(self):
+        handcrafted = {
+            "proposal_id": "p1",
+            "per_choice": {"yes": 10, "no": 5},
+            "effective_weights": {"a": 10, "b": 5},
+            "uncounted_weight": 0,
+            "counted_weight": 15,
+            "snapshot_total_weight": 15,
+            "winners": ["yes"],
+            "is_tie": False,
+            "quorum_met": True,
+            "approval_met": True,
+            "decision": "approved",
+        }
+        self.assertTrue(gt.verify_tally(self.data, handcrafted))
+
+    def _assert_rejected(self, result):
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally(self.data, result)
+
+    def test_missing_decision_field(self):
+        for field in ("quorum_met", "approval_met", "decision"):
+            bad = json.loads(json.dumps(self.result))
+            del bad[field]
+            self._assert_rejected(bad)
+
+    def test_extra_field_rejected(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["extra"] = 1
+        self._assert_rejected(bad)
+
+    def test_fields_wrong_order(self):
+        bad = json.loads(json.dumps(self.result))
+        reordered = {k: v for k, v in bad.items() if k != "quorum_met"}
+        reordered["quorum_met"] = True  # 挪到尾部
+        self._assert_rejected(reordered)
+
+        # 标志不同（rejected：quorum 真、approval 假）时互换键值：
+        # 键序不变但取值与重算结果不符，仍须复核失败。
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 15,
+                "approval_basis_points": 7000,
+            },
+        )
+        rejected = gt.tally_proposal(data)
+        self.assertEqual(rejected["decision"], "rejected")
+        swapped = json.loads(json.dumps(rejected))
+        swapped["quorum_met"], swapped["approval_met"] = (
+            swapped["approval_met"],
+            swapped["quorum_met"],
+        )
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally(data, swapped)
+
+    def test_tampered_threshold_flags(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["quorum_met"] = False
+        self._assert_rejected(bad)
+        bad = json.loads(json.dumps(self.result))
+        bad["approval_met"] = False
+        self._assert_rejected(bad)
+
+    def test_tampered_decision(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["decision"] = "rejected"
+        self._assert_rejected(bad)
+
+    def test_bad_threshold_types_and_values(self):
+        tamperings = [
+            ("quorum_met", 1),
+            ("quorum_met", "true"),
+            ("quorum_met", None),
+            ("approval_met", 0),
+            ("decision", "maybe"),
+            ("decision", 3),
+            ("decision", None),
+        ]
+        for field, value in tamperings:
+            bad = json.loads(json.dumps(self.result))
+            bad[field] = value
+            self._assert_rejected(bad)
+
+    def test_inconsistent_decision_combo(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["quorum_met"] = False
+        bad["approval_met"] = False
+        bad["decision"] = "approved"
+        self._assert_rejected(bad)
+
+    def test_no_quorum_case_verified(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}],
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 11,
+                "approval_basis_points": 5000,
+            },
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["decision"], "no_quorum")
+        self.assertTrue(gt.verify_tally(data, result))
+        bad = json.loads(json.dumps(result))
+        bad["decision"] = "approved"
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally(data, bad)
+
+    def test_decision_fields_without_config_rejected(self):
+        data = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}]
+        )
+        result = gt.tally_proposal(data)
+        self.assertTrue(gt.verify_tally(data, result))
+        for field, value in (
+            ("quorum_met", True),
+            ("approval_met", False),
+            ("decision", "approved"),
+        ):
+            bad = json.loads(json.dumps(result))
+            bad[field] = value
+            with self.assertRaises(gt.TallyVerificationError):
+                gt.verify_tally(data, bad)
+
+
+class CliDecisionRulesTests(unittest.TestCase):
+    def run_cli(self, payload):
+        proc = subprocess.run(
+            [sys.executable, str(MODULE)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, json.loads(proc.stdout), proc.stderr
+
+    def test_cli_decision_rules_success(self):
+        payload = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 15,
+                "approval_basis_points": 6000,
+            },
+        )
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertTrue(out["quorum_met"])
+        self.assertTrue(out["approval_met"])
+        self.assertEqual(out["decision"], "approved")
+        self.assertEqual(
+            list(out.keys())[-3:],
+            ["quorum_met", "approval_met", "decision"],
+        )
+
+    def test_cli_without_rules_shape_unchanged(self):
+        code, out, err = self.run_cli(base_input(votes=[{"voter": "a", "choice": "yes"}]))
+        self.assertEqual(code, 0)
+        for field in ("quorum_met", "approval_met", "decision"):
+            self.assertNotIn(field, out)
+
+    def test_cli_invalid_rules_exit_two(self):
+        bad_cases = [
+            {"approval_choices": ["yes"], "min_counted_weight": 1,
+             "approval_basis_points": 0},
+            {"approval_choices": ["nope"], "min_counted_weight": 1,
+             "approval_basis_points": 5000},
+            {"approval_choices": [], "min_counted_weight": 1,
+             "approval_basis_points": 5000},
+            {"approval_choices": ["yes"], "min_counted_weight": -1,
+             "approval_basis_points": 5000},
+            ["yes", 1, 5000],
+        ]
+        for rules in bad_cases:
+            with self.subTest(rules=rules):
+                payload = base_input(
+                    votes=[{"voter": "a", "choice": "yes"}],
+                    decision_rules=rules,
+                )
+                code, out, err = self.run_cli(payload)
+                self.assertEqual(code, 2)
+                self.assertEqual(err, "")
+                self.assertEqual(out["error"], "InvalidInputError")
+
+
 if __name__ == "__main__":
     unittest.main()
