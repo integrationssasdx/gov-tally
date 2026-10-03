@@ -4,7 +4,8 @@
 
 * 快照权重（snapshot）与逐跳委托（delegations）解析；
 * ``tally_proposal``：合并最终受托人权重并计票，支持提案级委托覆盖
-  （``delegation_override``：已委托者亲自投出本人权重，且不重复计入受托人）；
+  （``delegation_override``：已委托者亲自投出本人权重，且不重复计入受托人）
+  与可选权重来源追踪（``include_provenance``：结果附带 ``weight_provenance``）；
 * ``verify_tally``：独立复核字段、归属、守恒与汇总；
 * 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2。
 """
@@ -132,7 +133,11 @@ def _validate_input(data: Any):
         if not isinstance(account, str) or not isinstance(target, str):
             raise InvalidInputError("delegation accounts must be strings")
 
-    return proposal_id, choices, votes, snapshot, delegations
+    include_provenance = data.get("include_provenance", False)
+    if not isinstance(include_provenance, bool):
+        raise InvalidInputError("field 'include_provenance' must be a boolean")
+
+    return proposal_id, choices, votes, snapshot, delegations, include_provenance
 
 
 def _check_delegation_accounts(snapshot: dict, delegations: dict) -> None:
@@ -182,7 +187,9 @@ def _winners(choices: list[str], per_choice: dict) -> tuple[list[str], bool]:
 
 
 def _compute(data: Any) -> dict:
-    proposal_id, choices, votes, snapshot, delegations = _validate_input(data)
+    proposal_id, choices, votes, snapshot, delegations, include_provenance = (
+        _validate_input(data)
+    )
     _check_delegation_accounts(snapshot, delegations)
 
     # 为每个快照账户解析最终受托人；环在此处即被发现，即使该账户未投票。
@@ -247,7 +254,7 @@ def _compute(data: Any) -> dict:
     uncounted_weight = snapshot_total_weight - counted_weight
     winners, is_tie = _winners(choices, per_choice)
 
-    return {
+    result = {
         "proposal_id": proposal_id,
         "per_choice": per_choice,
         "effective_weights": effective_weights,
@@ -257,6 +264,39 @@ def _compute(data: Any) -> dict:
         "winners": winners,
         "is_tie": is_tie,
     }
+    if include_provenance:
+        result["weight_provenance"] = _build_provenance(votes, snapshot, trustee_of)
+    return result
+
+
+def _build_provenance(votes: list, snapshot: dict, trustee_of: dict) -> dict:
+    """按计票 voter（votes 顺序）列出正权重来源（snapshot 顺序）。
+
+    * 普通票（最终受托人）：本人与全部汇入上游账户，但被覆盖票抽走本人权重者除外；
+    * 覆盖票：仅投票者本人；
+    * 只列 snapshot 权重为正的来源，零权重计票映射为空；
+    * 每个 snapshot 账户至多出现在一张计票的来源中。
+    """
+    overridden = {
+        vote["voter"] for vote in votes if vote.get("delegation_override", False)
+    }
+    provenance: dict[str, dict] = {}
+    for vote in votes:
+        voter = vote["voter"]
+        if vote.get("delegation_override", False):
+            sources = (
+                {voter: snapshot[voter]} if snapshot[voter] > 0 else {}
+            )
+        else:
+            sources = {
+                account: snapshot[account]
+                for account in snapshot
+                if trustee_of[account] == voter
+                and account not in overridden
+                and snapshot[account] > 0
+            }
+        provenance[voter] = sources
+    return provenance
 
 
 def tally_proposal(input_data: dict) -> dict:
@@ -270,6 +310,9 @@ def verify_tally(input_data: dict, result: Any) -> bool:
     按覆盖语义独立重算，检查字段完整性、choice 顺序、权重归属
     （覆盖票记本人权重、受托人记剩余合并权重、选票归属）、
     权重守恒（counted + uncounted == snapshot_total）与汇总一致性。
+    输入含 ``include_provenance: true`` 时，另复核 ``weight_provenance``
+    的存在性、内外层键与顺序、来源归属、来源值（等于 snapshot 权重）、
+    映射求和（等于 effective_weights）与来源唯一归属。
     全部一致返回 True，否则抛 TallyVerificationError。
     """
     expected = _compute(input_data)
@@ -334,7 +377,54 @@ def verify_tally(input_data: dict, result: Any) -> bool:
     if not isinstance(is_tie, bool) or is_tie != expected["is_tie"]:
         raise TallyVerificationError("is_tie mismatch")
 
+    if "weight_provenance" in expected:
+        _verify_provenance(result, expected, effective_weights)
+
     return True
+
+
+def _verify_provenance(result: dict, expected: dict, effective_weights: dict) -> None:
+    """复核 weight_provenance：存在性、内外层键与顺序、来源归属、来源值、求和与唯一归属。"""
+    if "weight_provenance" not in result:
+        raise TallyVerificationError("result missing field: 'weight_provenance'")
+    provenance = result["weight_provenance"]
+    if not isinstance(provenance, dict):
+        raise TallyVerificationError("weight_provenance must be an object")
+
+    expected_provenance = expected["weight_provenance"]
+    if list(provenance.keys()) != list(expected_provenance.keys()):
+        raise TallyVerificationError("weight_provenance voters or their order mismatch")
+
+    seen_sources: set[str] = set()
+    for voter, sources in provenance.items():
+        expected_sources = expected_provenance[voter]
+        if not isinstance(sources, dict):
+            raise TallyVerificationError(
+                f"weight_provenance sources must be an object: {voter!r}"
+            )
+        if list(sources.keys()) != list(expected_sources.keys()):
+            raise TallyVerificationError(
+                f"weight_provenance sources or their order mismatch: {voter!r}"
+            )
+        for source, weight in sources.items():
+            if not _is_int(weight) or weight <= 0:
+                raise TallyVerificationError(
+                    f"weight_provenance source weight must be a positive integer: "
+                    f"{source!r}"
+                )
+            if source in seen_sources:
+                raise TallyVerificationError(
+                    f"weight_provenance source attributed to multiple votes: {source!r}"
+                )
+            seen_sources.add(source)
+            if weight != expected_sources[source]:
+                raise TallyVerificationError(
+                    f"weight_provenance source weight mismatch: {source!r}"
+                )
+        if sum(sources.values()) != effective_weights[voter]:
+            raise TallyVerificationError(
+                f"weight_provenance sources do not sum to effective weight: {voter!r}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

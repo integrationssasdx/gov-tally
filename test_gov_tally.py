@@ -733,5 +733,285 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("object at", outs[0])
 
 
+class ProvenanceTests(unittest.TestCase):
+    def test_omitted_or_false_leaves_output_unchanged(self):
+        data = base_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        plain = gt.tally_proposal(data)
+        self.assertNotIn("weight_provenance", plain)
+        explicit_false = gt.tally_proposal({**data, "include_provenance": False})
+        self.assertEqual(explicit_false, plain)
+
+    def test_non_boolean_include_provenance(self):
+        for value in ("true", 1, 0, None, [], {}):
+            with self.subTest(value=value):
+                data = base_input(include_provenance=value)
+                with self.assertRaises(gt.InvalidInputError):
+                    gt.tally_proposal(data)
+
+    def test_direct_votes_provenance(self):
+        data = base_input(
+            include_provenance=True,
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            result["weight_provenance"], {"a": {"a": 10}, "b": {"b": 5}}
+        )
+
+    def test_delegation_chain_provenance_snapshot_order(self):
+        # 内层按 snapshot 顺序，而非委托链顺序。
+        data = base_input(
+            include_provenance=True,
+            snapshot={"c": 4, "a": 2, "b": 3},
+            delegations={"a": "b", "b": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            result["weight_provenance"], {"c": {"c": 4, "a": 2, "b": 3}}
+        )
+
+    def test_override_provenance_attribution(self):
+        # a 覆盖抽走本人 2；c 的普通票只剩 c 与 b，a 归自己的票。
+        data = base_input(
+            include_provenance=True,
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[
+                {"voter": "a", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            result["weight_provenance"],
+            {"a": {"a": 2}, "c": {"b": 3, "c": 4}},
+        )
+
+    def test_multiple_overrides_each_own_vote(self):
+        data = base_input(
+            include_provenance=True,
+            snapshot={"a": 2, "c": 4, "d": 5},
+            delegations={"a": "d", "c": "d"},
+            votes=[
+                {"voter": "a", "choice": "yes", "delegation_override": True},
+                {"voter": "c", "choice": "no", "delegation_override": True},
+                {"voter": "d", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            result["weight_provenance"],
+            {"a": {"a": 2}, "c": {"c": 4}, "d": {"d": 5}},
+        )
+
+    def test_zero_weight_counted_vote_has_empty_mapping(self):
+        data = base_input(
+            include_provenance=True,
+            snapshot={"a": 0, "b": 5},
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(result["effective_weights"], {"a": 0, "b": 5})
+        self.assertEqual(
+            result["weight_provenance"], {"a": {}, "b": {"b": 5}}
+        )
+
+    def test_zero_weight_override_has_empty_mapping(self):
+        data = base_input(
+            include_provenance=True,
+            snapshot={"a": 0, "b": 5},
+            delegations={"a": "b"},
+            votes=[
+                {"voter": "a", "choice": "yes", "delegation_override": True},
+                {"voter": "b", "choice": "no"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            result["weight_provenance"], {"a": {}, "b": {"b": 5}}
+        )
+
+    def test_zero_weight_upstream_excluded_from_sources(self):
+        data = base_input(
+            include_provenance=True,
+            snapshot={"a": 0, "b": 3, "c": 4},
+            delegations={"a": "c", "b": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal(data)
+        self.assertEqual(
+            result["weight_provenance"], {"c": {"b": 3, "c": 4}}
+        )
+
+    def test_provenance_sums_match_effective_weights(self):
+        data = base_input(
+            include_provenance=True,
+            snapshot={"a": 2, "b": 3, "c": 4, "d": 5},
+            delegations={"a": "b", "b": "c"},
+            votes=[
+                {"voter": "b", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+                {"voter": "d", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal(data)
+        for voter, weight in result["effective_weights"].items():
+            self.assertEqual(
+                sum(result["weight_provenance"][voter].values()), weight
+            )
+        # 同一来源不重复归属。
+        all_sources = [
+            source
+            for sources in result["weight_provenance"].values()
+            for source in sources
+        ]
+        self.assertEqual(len(all_sources), len(set(all_sources)))
+
+
+class VerifyProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.data = base_input(
+            include_provenance=True,
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[
+                {"voter": "a", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+        )
+        self.result = gt.tally_proposal(self.data)
+
+    def test_verify_passes_for_fresh_computation(self):
+        self.assertEqual(
+            self.result["weight_provenance"],
+            {"a": {"a": 2}, "c": {"b": 3, "c": 4}},
+        )
+        self.assertTrue(gt.verify_tally(self.data, self.result))
+
+    def _assert_rejected(self, result):
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally(self.data, result)
+
+    def test_missing_provenance_field(self):
+        bad = json.loads(json.dumps(self.result))
+        del bad["weight_provenance"]
+        self._assert_rejected(bad)
+
+    def test_extra_voter_entry(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"]["b"] = {"b": 3}
+        self._assert_rejected(bad)
+
+    def test_outer_order_mismatch(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"] = {
+            "c": {"b": 3, "c": 4},
+            "a": {"a": 2},
+        }
+        self._assert_rejected(bad)
+
+    def test_inner_order_mismatch(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"]["c"] = {"c": 4, "b": 3}
+        self._assert_rejected(bad)
+
+    def test_misattributed_source(self):
+        # a 的来源被错挂到受托人 c 的票上。
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"] = {
+            "a": {},
+            "c": {"a": 2, "b": 3, "c": 4},
+        }
+        self._assert_rejected(bad)
+
+    def test_duplicate_attribution(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"] = {
+            "a": {"a": 2},
+            "c": {"a": 2, "b": 3, "c": 4},
+        }
+        self._assert_rejected(bad)
+
+    def test_source_weight_not_snapshot_weight(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"]["c"]["b"] = 1
+        self._assert_rejected(bad)
+
+    def test_non_integer_or_non_positive_source_weight(self):
+        for value in (2.0, "2", True, 0, -1):
+            with self.subTest(value=value):
+                bad = json.loads(json.dumps(self.result))
+                bad["weight_provenance"]["a"]["a"] = value
+                self._assert_rejected(bad)
+
+    def test_sum_mismatch_effective_weights(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["weight_provenance"]["c"] = {"b": 3}
+        self._assert_rejected(bad)
+
+    def test_extra_fields_unconstrained_when_flag_false(self):
+        data = base_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal(data)
+        result["weight_provenance"] = {"anything": {"goes": 1}}
+        self.assertTrue(gt.verify_tally(data, result))
+
+    def test_non_boolean_flag_in_verify_raises_input_error(self):
+        bad_data = json.loads(json.dumps(self.data))
+        bad_data["include_provenance"] = "true"
+        with self.assertRaises(gt.InvalidInputError):
+            gt.verify_tally(bad_data, self.result)
+
+
+class CliProvenanceTests(unittest.TestCase):
+    def run_cli(self, payload):
+        proc = subprocess.run(
+            [sys.executable, str(MODULE)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, json.loads(proc.stdout), proc.stderr
+
+    def test_cli_provenance_success(self):
+        payload = base_input(
+            include_provenance=True,
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[
+                {"voter": "a", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+        )
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            out["weight_provenance"], {"a": {"a": 2}, "c": {"b": 3, "c": 4}}
+        )
+
+    def test_cli_omitted_flag_output_shape_unchanged(self):
+        payload = base_input(votes=[{"voter": "a", "choice": "yes"}])
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 0)
+        self.assertNotIn("weight_provenance", out)
+
+    def test_cli_non_boolean_flag_error(self):
+        payload = base_input(include_provenance="true")
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "")
+        self.assertEqual(out["error"], "InvalidInputError")
+        self.assertIsInstance(out["message"], str)
+
+
 if __name__ == "__main__":
     unittest.main()

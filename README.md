@@ -12,7 +12,8 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 
 ## 状态
 
-已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核与 CLI。
+已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核、
+可选权重来源追踪（`include_provenance`）与 CLI。
 
 ## 安装与运行
 
@@ -36,6 +37,7 @@ cat proposal.json | python3 gov_tally.py
 | `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string）与可选布尔 `delegation_override` |
 | `snapshot` | object | account -> 非负整数权重 |
 | `delegations` | object | account -> account，逐跳指向受托人 |
+| `include_provenance` | bool（可选） | 省略或 `false` 时输出不变；`true` 时结果附带 `weight_provenance`；非布尔报 `InvalidInputError` |
 
 委托规则：
 
@@ -69,6 +71,20 @@ cat proposal.json | python3 gov_tally.py
 | `snapshot_total_weight` | 快照权重总和 |
 | `winners` | 唯一最大时为该选项；并列最大时为全部并列项（按 choices 顺序）；无有效票时为空列表 |
 | `is_tie` | 并列最大为 `true`；唯一最大或无有效票为 `false` |
+| `weight_provenance` | 仅 `include_provenance: true` 时出现；计票 voter -> 来源映射，详见下文 |
+
+权重来源追踪（`include_provenance: true`）：
+
+- `weight_provenance` 外层按 `votes` 中计票 voter 顺序排列；内层按 `snapshot` 顺序只列正权重来源。
+- 普通票（最终受托人）的来源含受托人本人与全部汇入上游账户，但被 `delegation_override`
+  抽走本人权重者不进入该票；覆盖票只含投票者本人及其 snapshot 权重；多个覆盖者各归自己的票。
+- 零权重计票在外层出现，映射为空；每个映射的来源权重之和等于该 voter 的 `effective_weights`。
+- 同一 snapshot 来源至多归属一张计票，不会同时归入受托人票与覆盖票。
+
+`verify_tally` 在 `include_provenance: true` 时另复核 `weight_provenance`：字段存在性、
+内外层键及顺序、来源归属、来源值等于 snapshot 权重、映射求和等于 `effective_weights`、
+同一来源不重复归属；缺失、额外、乱序、错配、重复归属、非整数或非正来源权重均抛
+`TallyVerificationError`。`include_provenance` 省略或为 `false` 时，结果中的额外字段不受约束。
 
 守恒关系：`counted_weight + uncounted_weight == snapshot_total_weight`。
 
@@ -98,13 +114,14 @@ verify_tally(input_data, result)  # 一致返回 True，否则抛 TallyVerificat
 
 `verify_tally` 按覆盖语义独立重算并逐字段复核：字段完整性、`per_choice` 选项与顺序、
 权重归属（覆盖票本人权重、受托人剩余合并权重、选票归属）、守恒关系与汇总，以及
-`winners` / `is_tie`；不会只比较 winners。
+`winners` / `is_tie`；`include_provenance: true` 时还包括 `weight_provenance` 的
+来源归属与求和；不会只比较 winners。
 
 ## 异常
 
 | 异常类 | 触发条件 |
 | --- | --- |
-| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
+| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override`、`include_provenance` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
 | `InvalidDelegationError` | `delegations` 的委托方或受托方不在 `snapshot` 中 |
 | `DelegationCycleError` | 委托链成环且无法到达最终受托人 |
 | `InvalidVoteError` | voter 重复、普通票来自已委托他人者、覆盖票来自未委托他人者、voter 不在 snapshot、choice 不在 choices |
