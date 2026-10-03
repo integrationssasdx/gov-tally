@@ -7,6 +7,8 @@
   （``delegation_override``：已委托者亲自投出本人权重，且不重复计入受托人）；
 * 可选权重来源追踪（``include_provenance``）：结果增加 ``weight_provenance``，
   逐票列出正权重来源账户及其 snapshot 权重；
+* 可选门槛判定（``decision_rules``）：按原规则计票后追加
+  ``quorum_met`` / ``approval_met`` / ``decision``；
 * ``verify_tally``：独立复核字段、归属、守恒与汇总；
 * 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2。
 """
@@ -39,13 +41,18 @@ _RESULT_FIELDS = (
     "is_tie",
 )
 
+_DECISION_FIELDS = ("quorum_met", "approval_met", "decision")
+
+_DECISION_VALUES = ("no_quorum", "approved", "rejected")
+
 
 class TallyError(Exception):
     """所有计票异常的基类。"""
 
 
 class InvalidInputError(TallyError):
-    """输入缺少字段、类型错误、取值非法（如负权重、choices 空或重复）。"""
+    """输入缺少字段、类型错误、取值非法（如负权重、choices 空或重复、
+    decision_rules 结构或取值非法）。"""
 
 
 class InvalidDelegationError(TallyError):
@@ -134,7 +141,65 @@ def _validate_input(data: Any):
         if not isinstance(account, str) or not isinstance(target, str):
             raise InvalidInputError("delegation accounts must be strings")
 
-    return proposal_id, choices, votes, snapshot, delegations
+    decision_rules = _validate_decision_rules(data, choices)
+
+    return proposal_id, choices, votes, snapshot, delegations, decision_rules
+
+
+def _validate_decision_rules(data: dict, choices: list) -> dict | None:
+    """校验可选的 decision_rules；缺省返回 None。
+
+    配置必须恰好含 approval_choices（choices 的非空无重复子集）、
+    min_counted_weight（非负整数）、approval_basis_points（1..10000 整数）；
+    布尔值不算整数。任何非法均抛 InvalidInputError。
+    """
+    if "decision_rules" not in data:
+        return None
+    rules = data["decision_rules"]
+    if not isinstance(rules, dict):
+        raise InvalidInputError("field 'decision_rules' must be an object")
+
+    required = ("approval_choices", "min_counted_weight", "approval_basis_points")
+    for field in required:
+        if field not in rules:
+            raise InvalidInputError(f"decision_rules missing field: {field!r}")
+    for key in rules:
+        if key not in required:
+            raise InvalidInputError(f"decision_rules unexpected field: {key!r}")
+
+    approval_choices = rules["approval_choices"]
+    if not isinstance(approval_choices, list):
+        raise InvalidInputError("decision_rules.approval_choices must be a list")
+    if len(approval_choices) == 0:
+        raise InvalidInputError("decision_rules.approval_choices must not be empty")
+    choice_set = set(choices)
+    seen_approval: set[str] = set()
+    for choice in approval_choices:
+        if not isinstance(choice, str):
+            raise InvalidInputError("every approval choice must be a string")
+        if choice in seen_approval:
+            raise InvalidInputError(f"duplicate approval choice: {choice!r}")
+        if choice not in choice_set:
+            raise InvalidInputError(f"approval choice not in choices: {choice!r}")
+        seen_approval.add(choice)
+
+    min_counted_weight = rules["min_counted_weight"]
+    if not _is_int(min_counted_weight) or min_counted_weight < 0:
+        raise InvalidInputError(
+            "decision_rules.min_counted_weight must be a non-negative integer"
+        )
+
+    approval_basis_points = rules["approval_basis_points"]
+    if not _is_int(approval_basis_points) or not 1 <= approval_basis_points <= 10000:
+        raise InvalidInputError(
+            "decision_rules.approval_basis_points must be an integer in [1, 10000]"
+        )
+
+    return {
+        "approval_choices": approval_choices,
+        "min_counted_weight": min_counted_weight,
+        "approval_basis_points": approval_basis_points,
+    }
 
 
 def _check_delegation_accounts(snapshot: dict, delegations: dict) -> None:
@@ -196,7 +261,9 @@ def _resolve_provenance_flag(data: dict, include_provenance: Any) -> bool:
 
 
 def _compute(data: Any, include_provenance: Any = _UNSET) -> dict:
-    proposal_id, choices, votes, snapshot, delegations = _validate_input(data)
+    proposal_id, choices, votes, snapshot, delegations, decision_rules = (
+        _validate_input(data)
+    )
     _check_delegation_accounts(snapshot, delegations)
     include_provenance = _resolve_provenance_flag(data, include_provenance)
 
@@ -294,7 +361,42 @@ def _compute(data: Any, include_provenance: Any = _UNSET) -> dict:
             "is_tie": is_tie,
         }
     )
+    if decision_rules is not None:
+        result.update(_decide(decision_rules, per_choice, counted_weight))
     return result
+
+
+def _decide(decision_rules: dict, per_choice: dict, counted_weight: int) -> dict:
+    """门槛判定：先按原规则计票，再据 decision_rules 追加判定字段。
+
+    * quorum_met：counted_weight 大于零且不少于 min_counted_weight；
+    * approval_met：approval_choices 的 per_choice 权重和乘 10000
+      不少于 counted_weight 乘 approval_basis_points；
+    * decision：quorum_met 为假 -> no_quorum；两个判定皆真 -> approved；
+      其余 -> rejected。
+    """
+    approval_weight = sum(
+        per_choice[choice] for choice in decision_rules["approval_choices"]
+    )
+    quorum_met = (
+        counted_weight > 0
+        and counted_weight >= decision_rules["min_counted_weight"]
+    )
+    approval_met = (
+        approval_weight * 10000
+        >= counted_weight * decision_rules["approval_basis_points"]
+    )
+    if not quorum_met:
+        decision = "no_quorum"
+    elif approval_met:
+        decision = "approved"
+    else:
+        decision = "rejected"
+    return {
+        "quorum_met": quorum_met,
+        "approval_met": approval_met,
+        "decision": decision,
+    }
 
 
 def tally_proposal(input_data: dict, include_provenance: Any = _UNSET) -> dict:
@@ -302,6 +404,8 @@ def tally_proposal(input_data: dict, include_provenance: Any = _UNSET) -> dict:
 
     ``include_provenance`` 为 True 时结果增加 ``weight_provenance``；
     省略时回退到输入中的 ``include_provenance`` 字段，默认 False（输出形状不变）。
+    输入含 ``decision_rules`` 时结果在既有字段后追加
+    ``quorum_met`` / ``approval_met`` / ``decision``；不含时输出形状不变。
     """
     return _compute(input_data, include_provenance)
 
@@ -318,6 +422,8 @@ def verify_tally(
     （存在性、内外层键及顺序、来源归属、来源值等于 snapshot 权重、
     映射求和等于 effective_weights、同一来源至多归属一张计票）；
     为 False 时结果中的额外字段不受约束。
+    输入含 ``decision_rules`` 时另复核 ``quorum_met`` / ``approval_met`` /
+    ``decision``：必须依次位于既有字段之后，类型、取值与决策均与独立重算一致。
     全部一致返回 True，否则抛 TallyVerificationError。
     """
     expected = _compute(input_data, include_provenance)
@@ -385,7 +491,31 @@ def verify_tally(
     if "weight_provenance" in expected:
         _verify_provenance(result, expected, effective_weights)
 
+    if "decision" in expected:
+        _verify_decision(result, expected)
+
     return True
+
+
+def _verify_decision(result: dict, expected: dict) -> None:
+    """复核 decision_rules 衍生字段：依次位于既有字段之后，类型与取值一致。"""
+    if list(result.keys())[-len(_DECISION_FIELDS):] != list(_DECISION_FIELDS):
+        raise TallyVerificationError(
+            "result must end with quorum_met, approval_met, decision in that order"
+        )
+    for field in ("quorum_met", "approval_met"):
+        value = result[field]
+        if not isinstance(value, bool):
+            raise TallyVerificationError(f"{field} must be a boolean")
+        if value != expected[field]:
+            raise TallyVerificationError(f"{field} mismatch")
+    decision = result["decision"]
+    if not isinstance(decision, str) or decision not in _DECISION_VALUES:
+        raise TallyVerificationError(
+            "decision must be one of: no_quorum, approved, rejected"
+        )
+    if decision != expected["decision"]:
+        raise TallyVerificationError("decision mismatch")
 
 
 def _verify_provenance(result: dict, expected: dict, effective_weights: dict) -> None:

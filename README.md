@@ -13,7 +13,7 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 ## 状态
 
 已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核、
-可选权重来源追踪（`include_provenance`）与 CLI。
+可选权重来源追踪（`include_provenance`）、可选门槛判定（`decision_rules`）与 CLI。
 
 ## 安装与运行
 
@@ -38,6 +38,7 @@ cat proposal.json | python3 gov_tally.py
 | `snapshot` | object | account -> 非负整数权重 |
 | `delegations` | object | account -> account，逐跳指向受托人 |
 | `include_provenance` | bool（可选） | 为 `true` 时结果增加 `weight_provenance`；省略或 `false` 时输出形状不变 |
+| `decision_rules` | object（可选） | 门槛判定配置，恰好含 `approval_choices`、`min_counted_weight`、`approval_basis_points` 三个字段；省略时输出形状不变 |
 
 委托规则：
 
@@ -70,6 +71,21 @@ cat proposal.json | python3 gov_tally.py
 - 零权重计票仍在外层出现，其来源映射为空；零权重账户不作为来源列出。
 - `include_provenance` 取值非布尔（如字符串 `"true"`、数字 `1`、`null`）报 `InvalidInputError`。
 
+门槛判定（`decision_rules`）：
+
+- 省略：Python API 与命令行输出形状不变，结果不含 `quorum_met` / `approval_met` / `decision`。
+- 存在：必须是恰好含以下三个字段的对象，否则报 `InvalidInputError`（字段缺失或多余同）：
+  - `approval_choices`：`choices` 的非空、无重复子集（成员均为 string）；
+  - `min_counted_weight`：非负整数；
+  - `approval_basis_points`：1 到 10000 的整数；
+  - 布尔值不算整数（如 `true` 作为后两字段取值非法）。
+- 配置存在时先按原规则计票，再在既有字段之后依次追加：
+  - `quorum_met`：`counted_weight` 大于零且不少于 `min_counted_weight`；
+  - `approval_met`：`approval_choices` 的 `per_choice` 权重和乘 10000 不少于
+    `counted_weight` 乘 `approval_basis_points`（边界取等即通过）；
+  - `decision`：`quorum_met` 为假时 `no_quorum`；两个判定皆真时 `approved`；其余 `rejected`。
+- 判定不改变计票本身：零权重、委托环、覆盖票、来源追踪等行为与无配置时一致。
+
 ## 输出格式
 
 `per_choice` 的键顺序与输入 `choices` 完全一致；所有权重与汇总均为整数。
@@ -85,6 +101,9 @@ cat proposal.json | python3 gov_tally.py
 | `snapshot_total_weight` | 快照权重总和 |
 | `winners` | 唯一最大时为该选项；并列最大时为全部并列项（按 choices 顺序）；无有效票时为空列表 |
 | `is_tie` | 并列最大为 `true`；唯一最大或无有效票为 `false` |
+| `quorum_met` | 仅 `decision_rules` 存在时出现：法定人数门槛是否达成（bool） |
+| `approval_met` | 仅 `decision_rules` 存在时出现：赞成比例门槛是否达成（bool） |
+| `decision` | 仅 `decision_rules` 存在时出现：`no_quorum` / `approved` / `rejected` |
 
 守恒关系：`counted_weight + uncounted_weight == snapshot_total_weight`。
 
@@ -123,12 +142,15 @@ verify_tally(input_data, result, include_provenance=True)
 来源归属、来源值等于 snapshot 权重、映射求和等于 `effective_weights`，以及同一 snapshot
 来源至多归属一张计票；缺失、额外、乱序、错配、重复归属、非整数或非正来源权重均抛
 `TallyVerificationError`。为 `false` 时结果中的额外字段不受约束。
+输入含 `decision_rules` 时另复核 `quorum_met` / `approval_met` / `decision`：必须依次
+位于既有字段之后，类型（bool / bool / 三选一字符串）、取值与决策均与独立重算一致，
+否则抛 `TallyVerificationError`。
 
 ## 异常
 
 | 异常类 | 触发条件 |
 | --- | --- |
-| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override`、`include_provenance` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON |
+| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override`、`include_provenance` 非布尔）、权重非整数或为负、`choices` 为空或重复、`decision_rules` 非对象、字段缺失或多余、`approval_choices` 非法、`min_counted_weight` / `approval_basis_points` 类型或范围非法、输入不是合法 JSON |
 | `InvalidDelegationError` | `delegations` 的委托方或受托方不在 `snapshot` 中 |
 | `DelegationCycleError` | 委托链成环且无法到达最终受托人 |
 | `InvalidVoteError` | voter 重复、普通票来自已委托他人者、覆盖票来自未委托他人者、voter 不在 snapshot、choice 不在 choices |
