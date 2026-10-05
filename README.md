@@ -13,7 +13,8 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 ## 状态
 
 已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核、
-可选权重来源追踪（`include_provenance`）、可选门槛判定（`decision_rules`）与 CLI。
+可选权重来源追踪（`include_provenance`）、可选门槛判定（`decision_rules`）与 CLI；
+结果复核（review）同样独立核对覆盖票归属、完整选项（`choices`）与门槛判定。
 
 ## 安装与运行
 
@@ -156,7 +157,8 @@ cat review_input.json | python3 gov_tally.py review
 cat review_input.json | python3 gov_tally.py review
 ```
 
-输入为**恰好**含以下六个字段的 JSON 对象（缺字段、多字段、非法 JSON 或输入非对象均报
+输入为含以下六个必填字段的 JSON 对象（另可含可选字段 `choices` 与
+`decision_rules`；缺必填字段、多未知字段、非法 JSON 或输入非对象均报
 `InvalidInputError`）：
 
 | 字段 | 类型 | 说明 |
@@ -164,25 +166,53 @@ cat review_input.json | python3 gov_tally.py review
 | `proposal_id` | string | 提案标识 |
 | `snapshot_block` | int | 非负整数快照区块（布尔值不算整数） |
 | `snapshot` | object | account -> 非负整数权重 |
-| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string） |
+| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string）与可选布尔 `delegation_override` |
 | `delegations` | object | account -> 受托 account |
 | `claimed_result` | object | 待核对结果 |
+| `choices` | string[]（可选） | 非空、不重复的完整选项列表；省略时选项从投票派生 |
+| `decision_rules` | object（可选） | 门槛判定配置，与计票入口同构；存在时必须同时提供 `choices` |
 
-校验后逐跳解析委托，把权重归到投票受托人并累计选项，再汇总直接参与、委托参与与未参与
-权重；`delegation_override` 与 `decision_rules` 不进入 review。输出字段固定顺序：
+校验后逐跳解析委托，把权重归到投票受托人并累计选项。选票可带
+`delegation_override`：缺失或 `false` 沿用普通票语义（只由未委托他人者
+投出）；`true` 仅允许已委托他人者投出——其本人权重直接计入所选选项且
+不再交给受托人，经其转发的他人权重仍逐跳归最终受托人，扣除与选票顺序
+无关，每账户至多一票。`delegation_override` 非布尔、覆盖票来自未委托
+他人者报 `BallotValidationError`。
+
+`choices` 省略时选项集合从投票记录派生；给出时 `results_by_choice` 含
+全部选项（未被投出者为 0），一律按选项名排序。投票选项不在 `choices`
+内报 `BallotValidationError`；`choices` 为空、重复或成员非字符串报
+`InvalidInputError`。
+
+`decision_rules` 的校验与计算沿用 `tally_proposal`（字段、类型、范围、
+判定均一致；非法配置报 `InvalidInputError`）。有配置时在既有输出字段
+之后按 `quorum_met`、`approval_met`、`decision` 顺序追加，并与
+`claimed_result` 逐项比较；无配置时 `claimed_result` 出现任一门槛字段
+报 `ClaimedResultValidationError`。
+
+输出字段固定顺序：
 `proposal_id` / `snapshot_block` / `results_by_choice`（按 choice 排序）/
-`direct_participated_weight` / `delegated_weight` / `non_participated_weight` /
-`effective_delegations`（按 delegator 排序）/ `weight_conservation_holds`
-（三类权重之和是否等于快照权重总和）/ `review_status` / `field_differences`。
+`direct_participated_weight`（投票者本人权重：投普通票的受托人本人 +
+覆盖票投票者本人）/ `delegated_weight`（经有效委托送达已投票受托人的
+他人权重）/ `non_participated_weight`（其余权重）/
+`effective_delegations`（按 delegator 排序；不列覆盖者本人权重，实际
+转发的上游权重按来源账户列入）/ `weight_conservation_holds`
+（三类权重之和是否等于快照权重总和）/ `review_status` / `field_differences`，
+有 `decision_rules` 时尾部追加三个门槛字段。三类权重守恒。
 
-`claimed_result` 缺字段或值不同进入 `field_differences`，每项含 `field`、`computed`、
-`claimed`；无差异时 `review_status` 为 `"matched"`，有差异为 `"mismatched"`。
+`claimed_result` 缺字段或值不同进入 `field_differences`，每项含 `field`、
+`computed`、`claimed`；无差异时 `review_status` 为 `"matched"`，有差异为
+`"mismatched"`。
 字段取值校验的异常分类：`SnapshotIntegrityError`（提案标识、快照区块、快照账户或权重
-不合法）、`BallotValidationError`（选票不合法）、`DelegationConflictError`（委托引用
-快照外账户、自委托、成环或一账户多受托人）、`ClaimedResultValidationError`
-（待核对结果非对象、含未知字段或 `results_by_choice` 键非字符串）。Python API 对应
+不合法）、`BallotValidationError`（投票者不在快照、同一账户多票、选项非字符串或越界、
+普通票来自已委托他人者、覆盖票来自未委托他人者、`delegation_override` 非布尔）、
+`DelegationConflictError`（委托引用快照外账户、自委托、成环或一账户多受托人）、
+`InvalidInputError`（顶层结构、`choices`、`decision_rules` 非法，或配置缺少 `choices`）、
+`ClaimedResultValidationError`
+（待核对结果非对象、含未知字段——无配置时含门槛字段——或 `results_by_choice` 键非字符串）。
+Python API 对应
 `build_review_package(proposal_id, snapshot_block, snapshot, votes, delegations,
-claimed_result)`。
+claimed_result, choices=None, decision_rules=None)`。
 
 ## Python API
 

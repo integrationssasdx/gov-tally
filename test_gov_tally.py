@@ -2070,8 +2070,551 @@ class ReviewPackageErrorTests(unittest.TestCase):
             )
 
 
-class CliReviewTests(unittest.TestCase):
-    """review 子命令：stdin 复核包输入 -> stdout 复核包结果。"""
+class ReviewOverrideTests(unittest.TestCase):
+    """review：delegation_override 覆盖票的归属与守恒。"""
+
+    def build(self, claimed_result, **overrides):
+        data = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 2, "b": 3, "c": 4},
+            "votes": [
+                {"voter": "b", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+            "delegations": {"a": "b", "b": "c"},
+        }
+        data.update(overrides)
+        return gt.build_review_package(
+            data["proposal_id"], data["snapshot_block"], data["snapshot"],
+            data["votes"], data["delegations"], claimed_result,
+        )
+
+    def claimed(self, **overrides):
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"no": 3, "yes": 6},
+            "direct_participated_weight": 7,
+            "delegated_weight": 2,
+            "non_participated_weight": 0,
+        }
+        claim.update(overrides)
+        return claim
+
+    def test_override_own_weight_direct_upstream_still_delegated(self):
+        # a->b->c：b 覆盖投本人 3（direct）；a 的 2 仍转发到已投票受托人 c
+        # （delegated）；c 本人 4 是 direct。
+        pkg = self.build(self.claimed())
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertTrue(pkg["weight_conservation_holds"])
+        self.assertEqual(pkg["results_by_choice"], {"no": 3, "yes": 6})
+        self.assertEqual(pkg["direct_participated_weight"], 7)
+        self.assertEqual(pkg["delegated_weight"], 2)
+        self.assertEqual(pkg["non_participated_weight"], 0)
+        # 覆盖者 b 本人权重不列入委托明细；实际转发的上游 a 按来源列入。
+        self.assertEqual(
+            pkg["effective_delegations"],
+            [{"delegator": "a", "trustee": "c", "weight": 2}],
+        )
+
+    def test_order_does_not_affect_deduction(self):
+        # 受托人票在前、覆盖票在后，结果与顺序无关。
+        pkg = self.build(
+            self.claimed(results_by_choice={"no": 2, "yes": 7},
+                         direct_participated_weight=6,
+                         delegated_weight=3),
+            votes=[
+                {"voter": "c", "choice": "yes"},
+                {"voter": "a", "choice": "no", "delegation_override": True},
+            ],
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["results_by_choice"], {"no": 2, "yes": 7})
+        # a 覆盖抽走 2；b 的 3 仍到 c：受托人 c 合并 4+3=7。
+        self.assertEqual(pkg["direct_participated_weight"], 6)  # c4 + a2
+        self.assertEqual(pkg["delegated_weight"], 3)
+        self.assertEqual(
+            pkg["effective_delegations"],
+            [{"delegator": "b", "trustee": "c", "weight": 3}],
+        )
+
+    def test_override_without_trustee_vote_rest_is_unparticipated(self):
+        # a 覆盖投出本人 2；受托人 b 未投票，b 的 3 保留为未参与。
+        pkg = gt.build_review_package(
+            "p1", 42, {"a": 2, "b": 3},
+            [{"voter": "a", "choice": "yes", "delegation_override": True}],
+            {"a": "b"},
+            {
+                "proposal_id": "p1", "snapshot_block": 42,
+                "results_by_choice": {"yes": 2},
+                "direct_participated_weight": 2,
+                "delegated_weight": 0,
+                "non_participated_weight": 3,
+            },
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["results_by_choice"], {"yes": 2})
+        self.assertEqual(pkg["effective_delegations"], [])
+        self.assertTrue(pkg["weight_conservation_holds"])
+
+    def test_multiple_overrides_each_counted_direct(self):
+        # a、c 各自覆盖投本人；受托人 d 投票只持本人 5；b->d 的 3 仍受托。
+        pkg = gt.build_review_package(
+            "p1", 42,
+            {"a": 2, "b": 3, "c": 4, "d": 5},
+            [
+                {"voter": "a", "choice": "yes", "delegation_override": True},
+                {"voter": "c", "choice": "no", "delegation_override": True},
+                {"voter": "d", "choice": "yes"},
+            ],
+            {"a": "d", "b": "d", "c": "d"},
+            {
+                "proposal_id": "p1", "snapshot_block": 42,
+                "results_by_choice": {"no": 4, "yes": 10},
+                "direct_participated_weight": 11,
+                "delegated_weight": 3,
+                "non_participated_weight": 0,
+            },
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(
+            pkg["effective_delegations"],
+            [{"delegator": "b", "trustee": "d", "weight": 3}],
+        )
+
+    def test_override_zero_weight_is_direct_zero(self):
+        pkg = gt.build_review_package(
+            "p1", 42, {"a": 0, "b": 5},
+            [
+                {"voter": "a", "choice": "yes", "delegation_override": True},
+                {"voter": "b", "choice": "no"},
+            ],
+            {"a": "b"},
+            {
+                "proposal_id": "p1", "snapshot_block": 42,
+                "results_by_choice": {"no": 5, "yes": 0},
+                "direct_participated_weight": 5,
+                "delegated_weight": 0,
+                "non_participated_weight": 0,
+            },
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertTrue(pkg["weight_conservation_holds"])
+
+    def test_override_false_delegated_account_still_rejected(self):
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                {},
+                votes=[{"voter": "b", "choice": "yes",
+                        "delegation_override": False}],
+            )
+
+    def test_override_without_delegation_is_ballot_error(self):
+        with self.assertRaises(gt.BallotValidationError):
+            gt.build_review_package(
+                "p1", 0, {"a": 1},
+                [{"voter": "a", "choice": "yes",
+                  "delegation_override": True}], {}, {},
+            )
+
+    def test_override_duplicate_voter_rejected(self):
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                {},
+                votes=[
+                    {"voter": "b", "choice": "yes",
+                     "delegation_override": True},
+                    {"voter": "b", "choice": "no",
+                     "delegation_override": True},
+                ],
+            )
+
+    def test_override_non_boolean_is_ballot_error(self):
+        for value in ("true", 1, 0, None, []):
+            with self.subTest(value=value):
+                with self.assertRaises(gt.BallotValidationError):
+                    self.build(
+                        {},
+                        votes=[{"voter": "b", "choice": "yes",
+                               "delegation_override": value}],
+                    )
+
+    def test_misclaimed_override_attribution_is_mismatched(self):
+        # 把覆盖者 b 的本人 3 错记为委托送达受托人：delegated 应为 2 非 5。
+        claim = self.claimed(delegated_weight=5, direct_participated_weight=4)
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "mismatched")
+        fields = {d["field"]: d for d in pkg["field_differences"]}
+        self.assertEqual(fields["delegated_weight"]["computed"], 2)
+        self.assertEqual(fields["delegated_weight"]["claimed"], 5)
+        self.assertEqual(fields["direct_participated_weight"]["computed"], 7)
+
+
+class ReviewChoicesTests(unittest.TestCase):
+    """review：可选 choices 给出完整选项集合。"""
+
+    BASE = dict(
+        proposal_id="p1",
+        snapshot_block=42,
+        snapshot={"a": 2, "b": 3, "c": 4, "d": 5, "e": 7},
+        votes=[{"voter": "c", "choice": "yes"}],
+        delegations={"a": "b", "b": "c", "d": "c"},
+    )
+
+    def claim(self, results, **overrides):
+        claim = {
+            "proposal_id": "p1", "snapshot_block": 42,
+            "results_by_choice": results,
+            "direct_participated_weight": 4,
+            "delegated_weight": 10,
+            "non_participated_weight": 7,
+        }
+        claim.update(overrides)
+        return claim
+
+    def build(self, choices, claimed_result, **overrides):
+        args = dict(self.BASE)
+        args.update(overrides)
+        return gt.build_review_package(
+            args["proposal_id"], args["snapshot_block"], args["snapshot"],
+            args["votes"], args["delegations"], claimed_result,
+            choices=choices,
+        )
+
+    def test_unvoted_choices_listed_as_zero_and_sorted(self):
+        pkg = self.build(
+            ["yes", "no", "abstain"],
+            self.claim({"abstain": 0, "no": 0, "yes": 14}),
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(
+            list(pkg["results_by_choice"].keys()),
+            ["abstain", "no", "yes"],
+        )
+        self.assertEqual(
+            pkg["results_by_choice"],
+            {"abstain": 0, "no": 0, "yes": 14},
+        )
+
+    def test_claimed_missing_zero_choice_is_mismatch(self):
+        pkg = self.build(["yes", "no"], self.claim({"yes": 14}))
+        self.assertEqual(pkg["review_status"], "mismatched")
+        diff = next(
+            d for d in pkg["field_differences"]
+            if d["field"] == "results_by_choice"
+        )
+        self.assertEqual(diff["computed"], {"no": 0, "yes": 14})
+        self.assertEqual(diff["claimed"], {"yes": 14})
+
+    def test_vote_choice_outside_choices_is_ballot_error(self):
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                ["yes", "no"], {},
+                votes=[{"voter": "c", "choice": "abstain"}],
+            )
+
+    def test_invalid_choices_raise_invalid_input(self):
+        kwargs = dict(self.BASE)
+        for bad in ([], ["yes", "yes"], ["yes", 3], "yes"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(gt.InvalidInputError):
+                    gt.build_review_package(
+                        kwargs["proposal_id"], kwargs["snapshot_block"],
+                        kwargs["snapshot"], kwargs["votes"],
+                        kwargs["delegations"], {}, choices=bad,
+                    )
+
+    def test_choices_empty_votes_gives_zero_results_for_all_choices(self):
+        pkg = gt.build_review_package(
+            "p1", 0, {"a": 1, "b": 2}, [], {},
+            {
+                "proposal_id": "p1", "snapshot_block": 0,
+                "results_by_choice": {"no": 0, "yes": 0},
+                "direct_participated_weight": 0,
+                "delegated_weight": 0,
+                "non_participated_weight": 3,
+            },
+            choices=["yes", "no"],
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(
+            pkg["results_by_choice"], {"no": 0, "yes": 0}
+        )
+
+
+class ReviewDecisionRulesTests(unittest.TestCase):
+    """review：decision_rules 门槛判定的独立核对。"""
+
+    RULES = {
+        "approval_choices": ["yes"],
+        "min_counted_weight": 5,
+        "approval_basis_points": 6000,
+    }
+
+    def build(self, claimed_result, rules=None, **overrides):
+        data = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 2, "b": 3, "c": 4},
+            "votes": [
+                {"voter": "b", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+            "delegations": {"a": "b", "b": "c"},
+            "choices": ["yes", "no"],
+        }
+        data.update(overrides)
+        return gt.build_review_package(
+            data["proposal_id"], data["snapshot_block"], data["snapshot"],
+            data["votes"], data["delegations"], claimed_result,
+            choices=data["choices"],
+            decision_rules=self.RULES if rules is None else rules,
+        )
+
+    def claim(self, **overrides):
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"no": 3, "yes": 6},
+            "direct_participated_weight": 7,
+            "delegated_weight": 2,
+            "non_participated_weight": 0,
+            "quorum_met": True,
+            "approval_met": True,
+            "decision": "approved",
+        }
+        claim.update(overrides)
+        return claim
+
+    def test_decision_fields_appended_and_matched(self):
+        pkg = self.build(self.claim())
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["field_differences"], [])
+        self.assertEqual(
+            list(pkg.keys())[-3:],
+            ["quorum_met", "approval_met", "decision"],
+        )
+        self.assertTrue(pkg["quorum_met"])
+        self.assertTrue(pkg["approval_met"])
+        self.assertEqual(pkg["decision"], "approved")
+
+    def test_rejected_decision_matched(self):
+        # 6/9 赞成 ≈ 6667bps：门槛 7000 -> rejected。
+        pkg = self.build(
+            self.claim(approval_met=False, decision="rejected"),
+            rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 5,
+                "approval_basis_points": 7000,
+            },
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertFalse(pkg["approval_met"])
+        self.assertEqual(pkg["decision"], "rejected")
+
+    def test_no_quorum_matched(self):
+        pkg = self.build(
+            self.claim(
+                results_by_choice={"no": 0, "yes": 0},
+                direct_participated_weight=0,
+                delegated_weight=0,
+                non_participated_weight=9,
+                quorum_met=False,
+                approval_met=True,
+                decision="no_quorum",
+            ),
+            rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 0,
+                "approval_basis_points": 5000,
+            },
+            votes=[],
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertFalse(pkg["quorum_met"])
+        self.assertEqual(pkg["decision"], "no_quorum")
+
+    def test_each_gate_field_mismatch_reports_computed_and_claimed(self):
+        for field, bad in (
+            ("quorum_met", False),
+            ("approval_met", False),
+            ("decision", "rejected"),
+        ):
+            with self.subTest(field=field):
+                pkg = self.build(self.claim(**{field: bad}))
+                self.assertEqual(pkg["review_status"], "mismatched")
+                diff = next(
+                    d for d in pkg["field_differences"] if d["field"] == field
+                )
+                self.assertEqual(diff["claimed"], bad)
+                self.assertNotEqual(diff["computed"], bad)
+
+    def test_missing_gate_field_is_a_difference(self):
+        claim = self.claim()
+        del claim["decision"]
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "mismatched")
+        diff = next(
+            d for d in pkg["field_differences"] if d["field"] == "decision"
+        )
+        self.assertEqual(diff["computed"], "approved")
+        self.assertIsNone(diff["claimed"])
+
+    def test_rules_require_choices(self):
+        with self.assertRaises(gt.InvalidInputError):
+            gt.build_review_package(
+                "p1", 42, {"a": 1}, [], {}, {},
+                decision_rules=self.RULES,
+            )
+
+    def test_invalid_rules_raise_invalid_input(self):
+        for bad in (
+            [],
+            {"approval_choices": ["nope"], "min_counted_weight": 1,
+             "approval_basis_points": 5000},
+            {"approval_choices": ["yes"], "min_counted_weight": -1,
+             "approval_basis_points": 5000},
+            {"approval_choices": ["yes"], "min_counted_weight": 1,
+             "approval_basis_points": 0},
+            {"approval_choices": [], "min_counted_weight": 1,
+             "approval_basis_points": 5000},
+            {"approval_choices": ["yes"], "min_counted_weight": 1},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(gt.InvalidInputError):
+                    self.build({}, rules=bad)
+
+    def test_gate_fields_without_rules_raise_claimed_result_error(self):
+        for field, value in (
+            ("quorum_met", True),
+            ("approval_met", False),
+            ("decision", "approved"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(gt.ClaimedResultValidationError):
+                    gt.build_review_package(
+                        "p1", 42, {"a": 1}, [], {},
+                        {field: value},
+                    )
+
+    def test_thresholds_count_delegated_and_override_weights(self):
+        # yes6+no3，counted 9，门槛 9 且赞成率 6667bps：approved。
+        pkg = self.build(
+            self.claim(),
+            rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 9,
+                "approval_basis_points": 6000,
+            },
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["decision"], "approved")
+
+
+class CliReviewExtensionTests(unittest.TestCase):
+    """review 子命令透传 choices / delegation_override / decision_rules。"""
+
+    def run_cli(self, payload):
+        proc = subprocess.run(
+            [sys.executable, str(MODULE), "review"],
+            input=json.dumps(payload),
+            capture_output=True, text=True,
+        )
+        return proc.returncode, json.loads(proc.stdout), proc.stderr
+
+    def payload(self, **overrides):
+        data = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 2, "b": 3, "c": 4},
+            "votes": [
+                {"voter": "b", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+            "delegations": {"a": "b", "b": "c"},
+            "choices": ["yes", "no"],
+            "decision_rules": {
+                "approval_choices": ["yes"],
+                "min_counted_weight": 5,
+                "approval_basis_points": 6000,
+            },
+            "claimed_result": {
+                "proposal_id": "p1",
+                "snapshot_block": 42,
+                "results_by_choice": {"no": 3, "yes": 6},
+                "direct_participated_weight": 7,
+                "delegated_weight": 2,
+                "non_participated_weight": 0,
+                "quorum_met": True,
+                "approval_met": True,
+                "decision": "approved",
+            },
+        }
+        data.update(overrides)
+        return data
+
+    def test_full_extension_matched(self):
+        code, out, err = self.run_cli(self.payload())
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["review_status"], "matched")
+        self.assertEqual(out["effective_delegations"],
+                         [{"delegator": "a", "trustee": "c", "weight": 2}])
+        self.assertEqual(
+            list(out.keys())[-3:],
+            ["quorum_met", "approval_met", "decision"],
+        )
+
+    def test_override_ballot_error(self):
+        payload = self.payload()
+        payload["votes"][0]["delegation_override"] = "true"
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "BallotValidationError")
+
+    def test_rules_without_choices_is_invalid_input(self):
+        payload = self.payload()
+        del payload["choices"]
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_gate_field_without_rules_is_claimed_error(self):
+        payload = self.payload()
+        del payload["decision_rules"]
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "ClaimedResultValidationError")
+
+    def test_explicit_null_optional_fields_rejected(self):
+        payload = self.payload()
+        payload["choices"] = None
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+        payload = self.payload()
+        payload["decision_rules"] = None
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_omitted_optional_fields_keeps_legacy_shape(self):
+        payload = self.payload()
+        del payload["choices"]
+        del payload["decision_rules"]
+        # 无 choices 时选项从投票派生（仅 no、yes，恰好相同），claimed 去掉门槛字段。
+        for field in ("quorum_met", "approval_met", "decision"):
+            del payload["claimed_result"][field]
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["review_status"], "matched")
+        for field in ("quorum_met", "approval_met", "decision"):
+            self.assertNotIn(field, out)
+
+
+
 
     def review_input(self, **overrides):
         data = {
@@ -2144,7 +2687,7 @@ class CliReviewTests(unittest.TestCase):
     def test_missing_or_extra_top_level_field(self):
         for mutate in (
             lambda d: d.pop("claimed_result"),
-            lambda d: d.__setitem__("choices", ["yes"]),
+            lambda d: d.__setitem__("bogus", ["yes"]),
         ):
             payload = self.review_input()
             mutate(payload)
@@ -2154,6 +2697,28 @@ class CliReviewTests(unittest.TestCase):
                 self.assertEqual(err, "")
                 self.assertEqual(out["error"], "InvalidInputError")
                 self.assertIsInstance(out["message"], str)
+
+    def test_optional_choices_and_decision_rules_accepted(self):
+        # 两个可选顶层字段不再被当作未知字段；省略 choices 派生选项，
+        # 给出 choices 与 decision_rules 时成功并追加门槛字段。
+        payload = self.review_input(
+            choices=["yes", "no"],
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 10,
+                "approval_basis_points": 5000,
+            },
+        )
+        payload["claimed_result"]["results_by_choice"] = {"no": 0, "yes": 14}
+        payload["claimed_result"].update(
+            quorum_met=True, approval_met=True, decision="approved"
+        )
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["review_status"], "matched")
+        self.assertEqual(list(out.keys())[-3:],
+                         ["quorum_met", "approval_met", "decision"])
 
     def test_non_object_and_invalid_json(self):
         for raw in ("[1, 2]", "42", "\"x\"", "{not json"):
