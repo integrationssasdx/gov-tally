@@ -21,10 +21,13 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 
 ```bash
 cat proposal.json | python3 gov_tally.py
+cat review_input.json | python3 gov_tally.py review
 ```
 
 - 成功：退出码 `0`，标准输出为结果 JSON。
 - 失败：退出码 `2`，标准输出为 `{"error": 异常类名, "message": 稳定描述}`，不输出 traceback。
+- 无参数：按提案计票输入处理；`review` 子命令：按复核包输入处理（见下文「结果复核」），
+  只新增输入输出路径，计票语义、异常与退出码不变。
 
 ## 输入格式
 
@@ -144,6 +147,42 @@ cat proposal.json | python3 gov_tally.py
   "decision": "approved"
 }
 ```
+
+## 结果复核（review）
+
+`review` 子命令对一次提案的计票结果做独立复核，不落盘：
+
+```bash
+cat review_input.json | python3 gov_tally.py review
+```
+
+输入为**恰好**含以下六个字段的 JSON 对象（缺字段、多字段、非法 JSON 或输入非对象均报
+`InvalidInputError`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `proposal_id` | string | 提案标识 |
+| `snapshot_block` | int | 非负整数快照区块（布尔值不算整数） |
+| `snapshot` | object | account -> 非负整数权重 |
+| `votes` | object[] | 选票列表，每项含 `voter`、`choice`（均为 string） |
+| `delegations` | object | account -> 受托 account |
+| `claimed_result` | object | 待核对结果 |
+
+校验后逐跳解析委托，把权重归到投票受托人并累计选项，再汇总直接参与、委托参与与未参与
+权重；`delegation_override` 与 `decision_rules` 不进入 review。输出字段固定顺序：
+`proposal_id` / `snapshot_block` / `results_by_choice`（按 choice 排序）/
+`direct_participated_weight` / `delegated_weight` / `non_participated_weight` /
+`effective_delegations`（按 delegator 排序）/ `weight_conservation_holds`
+（三类权重之和是否等于快照权重总和）/ `review_status` / `field_differences`。
+
+`claimed_result` 缺字段或值不同进入 `field_differences`，每项含 `field`、`computed`、
+`claimed`；无差异时 `review_status` 为 `"matched"`，有差异为 `"mismatched"`。
+字段取值校验的异常分类：`SnapshotIntegrityError`（提案标识、快照区块、快照账户或权重
+不合法）、`BallotValidationError`（选票不合法）、`DelegationConflictError`（委托引用
+快照外账户、自委托、成环或一账户多受托人）、`ClaimedResultValidationError`
+（待核对结果非对象、含未知字段或 `results_by_choice` 键非字符串）。Python API 对应
+`build_review_package(proposal_id, snapshot_block, snapshot, votes, delegations,
+claimed_result)`。
 
 ## Python API
 

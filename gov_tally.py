@@ -13,7 +13,8 @@
 * ``build_review_package``：独立的结果复核包装配，把一次提案的计票输入、
   有效委托、实际票权与待核对结果整理成确定性、可重复验证的返回对象
   （``matched`` / ``mismatched`` 逐项差异，不隐式写入文件、数据库或日志）；
-* 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2。
+* 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2；
+  无参数按提案计票输入处理，``review`` 子命令按复核包输入处理。
 """
 
 from __future__ import annotations
@@ -79,6 +80,16 @@ _CLAIMED_RESULT_FIELDS = (
     "direct_participated_weight",
     "delegated_weight",
     "non_participated_weight",
+)
+
+# review 子命令输入对象必须恰好包含的字段。
+_REVIEW_INPUT_FIELDS = (
+    "proposal_id",
+    "snapshot_block",
+    "snapshot",
+    "votes",
+    "delegations",
+    "claimed_result",
 )
 
 
@@ -979,17 +990,58 @@ def build_review_package(
     }
 
 
+def _read_stdin_json() -> Any:
+    """从标准输入读取并解析 JSON；非法 JSON 报 InvalidInputError。"""
+    raw = sys.stdin.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise InvalidInputError("input is not valid JSON")
+
+
+def _run_review_cli() -> dict:
+    """review 子命令：stdin 读取复核包输入，校验后装配复核包。
+
+    输入必须是恰好含 ``_REVIEW_INPUT_FIELDS`` 六个字段的 JSON 对象；
+    缺字段、多字段、非法 JSON 或输入非对象均报 InvalidInputError，
+    各字段的取值校验由 build_review_package 按既有规则完成。
+    """
+    data = _read_stdin_json()
+    if not isinstance(data, dict):
+        raise InvalidInputError("input must be a JSON object")
+    for field in _REVIEW_INPUT_FIELDS:
+        if field not in data:
+            raise InvalidInputError(f"missing field: {field!r}")
+    for field in data:
+        if field not in _REVIEW_INPUT_FIELDS:
+            raise InvalidInputError(f"unexpected field: {field!r}")
+    return build_review_package(
+        data["proposal_id"],
+        data["snapshot_block"],
+        data["snapshot"],
+        data["votes"],
+        data["delegations"],
+        data["claimed_result"],
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
-    """命令行入口：stdin JSON -> stdout JSON；成功退出 0，异常退出 2。"""
+    """命令行入口：stdin JSON -> stdout JSON；成功退出 0，异常退出 2。
+
+    无参数时按提案计票输入处理；``review`` 子命令按复核包输入处理，
+    只新增输入输出路径，计票与复核语义不变。
+    """
+    if argv is None:
+        argv = sys.argv[1:]
     try:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")
-        raw = sys.stdin.read()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            raise InvalidInputError("input is not valid JSON")
-        result = tally_proposal(data)
+        if not argv:
+            result = tally_proposal(_read_stdin_json())
+        elif argv == ["review"]:
+            result = _run_review_cli()
+        else:
+            raise InvalidInputError(f"unknown command: {argv[0]!r}")
     except TallyError as exc:
         json.dump(
             {"error": type(exc).__name__, "message": str(exc)},

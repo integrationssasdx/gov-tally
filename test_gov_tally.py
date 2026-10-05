@@ -2070,5 +2070,140 @@ class ReviewPackageErrorTests(unittest.TestCase):
             )
 
 
+class CliReviewTests(unittest.TestCase):
+    """review 子命令：stdin 复核包输入 -> stdout 复核包结果。"""
+
+    def review_input(self, **overrides):
+        data = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 2, "b": 3, "c": 4, "d": 5, "e": 7},
+            "votes": [{"voter": "c", "choice": "yes"}],
+            "delegations": {"a": "b", "b": "c", "d": "c"},
+            "claimed_result": {
+                "proposal_id": "p1",
+                "snapshot_block": 42,
+                "results_by_choice": {"yes": 14},
+                "direct_participated_weight": 4,
+                "delegated_weight": 10,
+                "non_participated_weight": 7,
+            },
+        }
+        data.update(overrides)
+        return data
+
+    def run_cli(self, payload, args=("review",)):
+        proc = subprocess.run(
+            [sys.executable, str(MODULE), *args],
+            input=payload if isinstance(payload, str) else json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, json.loads(proc.stdout), proc.stderr
+
+    def test_matched_success_exit_zero(self):
+        code, out, err = self.run_cli(self.review_input())
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["review_status"], "matched")
+        self.assertEqual(out["field_differences"], [])
+        self.assertTrue(out["weight_conservation_holds"])
+        self.assertEqual(out["results_by_choice"], {"yes": 14})
+        self.assertEqual(
+            list(out.keys()),
+            [
+                "proposal_id",
+                "snapshot_block",
+                "results_by_choice",
+                "direct_participated_weight",
+                "delegated_weight",
+                "non_participated_weight",
+                "effective_delegations",
+                "weight_conservation_holds",
+                "review_status",
+                "field_differences",
+            ],
+        )
+
+    def test_mismatched_exit_zero_with_field_differences(self):
+        payload = self.review_input()
+        payload["claimed_result"]["delegated_weight"] = 9
+        del payload["claimed_result"]["snapshot_block"]
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["review_status"], "mismatched")
+        self.assertEqual(
+            out["field_differences"],
+            [
+                {"field": "snapshot_block", "computed": 42, "claimed": None},
+                {"field": "delegated_weight", "computed": 10, "claimed": 9},
+            ],
+        )
+
+    def test_missing_or_extra_top_level_field(self):
+        for mutate in (
+            lambda d: d.pop("claimed_result"),
+            lambda d: d.__setitem__("choices", ["yes"]),
+        ):
+            payload = self.review_input()
+            mutate(payload)
+            with self.subTest(payload=sorted(payload)):
+                code, out, err = self.run_cli(payload)
+                self.assertEqual(code, 2)
+                self.assertEqual(err, "")
+                self.assertEqual(out["error"], "InvalidInputError")
+                self.assertIsInstance(out["message"], str)
+
+    def test_non_object_and_invalid_json(self):
+        for raw in ("[1, 2]", "42", "\"x\"", "{not json"):
+            with self.subTest(raw=raw):
+                code, out, err = self.run_cli(raw)
+                self.assertEqual(code, 2)
+                self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_each_error_class_on_stdout(self):
+        cases = [
+            (self.review_input(snapshot={"a": -1}), "SnapshotIntegrityError"),
+            (self.review_input(snapshot_block=True), "SnapshotIntegrityError"),
+            (
+                self.review_input(votes=[{"voter": "z", "choice": "yes"}]),
+                "BallotValidationError",
+            ),
+            (
+                self.review_input(delegations={"a": "b", "b": "a"}),
+                "DelegationConflictError",
+            ),
+            (
+                self.review_input(claimed_result={"bogus": 1}),
+                "ClaimedResultValidationError",
+            ),
+            (self.review_input(claimed_result=None), "ClaimedResultValidationError"),
+        ]
+        for payload, name in cases:
+            with self.subTest(name=name):
+                code, out, err = self.run_cli(payload)
+                self.assertEqual(code, 2)
+                self.assertEqual(err, "")
+                self.assertEqual(out["error"], name)
+                self.assertIsInstance(out["message"], str)
+                self.assertNotIn("0x", out["message"])  # 无内存地址
+
+    def test_unknown_command_is_invalid_input(self):
+        code, out, err = self.run_cli(self.review_input(), args=("tally",))
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_no_args_keeps_tally_behavior(self):
+        payload = base_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}]
+        )
+        code, out, err = self.run_cli(payload, args=())
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["per_choice"], {"yes": 10, "no": 5})
+        self.assertNotIn("review_status", out)
+
+
 if __name__ == "__main__":
     unittest.main()
