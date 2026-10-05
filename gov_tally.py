@@ -13,7 +13,8 @@
 * ``build_review_package``：独立的结果复核包装配，把一次提案的计票输入、
   有效委托、实际票权与待核对结果整理成确定性、可重复验证的返回对象
   （``matched`` / ``mismatched`` 逐项差异，不隐式写入文件、数据库或日志）；
-* 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2。
+* 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2；
+  无参数运行原计票，``review`` 子命令读取复核输入并输出复核包。
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ __all__ = [
     "tally_proposal",
     "verify_tally",
     "build_review_package",
+    "review_package_from_input",
 ]
 
 _RESULT_FIELDS = (
@@ -79,6 +81,16 @@ _CLAIMED_RESULT_FIELDS = (
     "direct_participated_weight",
     "delegated_weight",
     "non_participated_weight",
+)
+
+# review 命令行输入必须恰好包含的顶层字段及其解包顺序。
+_REVIEW_INPUT_FIELDS = (
+    "proposal_id",
+    "snapshot_block",
+    "snapshot",
+    "votes",
+    "delegations",
+    "claimed_result",
 )
 
 
@@ -979,17 +991,68 @@ def build_review_package(
     }
 
 
+def review_package_from_input(data: Any) -> dict:
+    """校验 review 命令行输入并生成复核包。
+
+    输入必须是恰好含 ``proposal_id`` / ``snapshot_block`` / ``snapshot`` /
+    ``votes`` / ``delegations`` / ``claimed_result`` 六个字段的 JSON 对象；
+    顶层字段缺失或多余、JSON 非法或根不是对象均报 ``InvalidInputError``。
+    各字段的语义校验与计票复核沿用 :func:`build_review_package` 及其
+    既有的四类异常；``delegation_override`` 与 ``decision_rules`` 不属于
+    review 输入，出现即作为多余顶层字段拒绝。
+    """
+    if not isinstance(data, dict):
+        raise InvalidInputError("input must be a JSON object")
+    required = set(_REVIEW_INPUT_FIELDS)
+    for field in _REVIEW_INPUT_FIELDS:
+        if field not in data:
+            raise InvalidInputError(f"missing field: {field!r}")
+    for field in data:
+        if field not in required:
+            raise InvalidInputError(f"unexpected field: {field!r}")
+
+    return build_review_package(
+        data["proposal_id"],
+        data["snapshot_block"],
+        data["snapshot"],
+        data["votes"],
+        data["delegations"],
+        data["claimed_result"],
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
-    """命令行入口：stdin JSON -> stdout JSON；成功退出 0，异常退出 2。"""
+    """命令行入口。
+
+    * 无参数：从 stdin JSON 运行原计票（:func:`tally_proposal`），
+      输入输出字段、异常与退出码保持不变；
+    * ``review``：stdin JSON 为复核输入（见
+      :func:`review_package_from_input`），stdout 输出独立复核包；
+    * 其余参数：报 ``InvalidInputError``。
+
+    成功退出 0，:class:`TallyError` 以 ``{"error", "message"}`` 输出到
+    stdout 并退出 2；不落盘。
+    """
+    if argv is None:
+        argv = sys.argv[1:]
     try:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")
+        if len(argv) > 1:
+            raise InvalidInputError(f"unexpected arguments: {argv[1:]!r}")
+        command = argv[0] if argv else None
+        if command is not None and command != "review":
+            raise InvalidInputError(f"unknown command: {command!r}")
+
         raw = sys.stdin.read()
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             raise InvalidInputError("input is not valid JSON")
-        result = tally_proposal(data)
+        if command == "review":
+            result = review_package_from_input(data)
+        else:
+            result = tally_proposal(data)
     except TallyError as exc:
         json.dump(
             {"error": type(exc).__name__, "message": str(exc)},

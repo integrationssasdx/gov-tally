@@ -7,24 +7,33 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 本仓库从零开始实现上述方向的可用工具，不依赖外部同类实现。
 
 - 仅依赖 Python 3.12 标准库，无第三方包。
-- 核心模块：`gov_tally.py`（`tally_proposal` / `verify_tally` / 异常类）。
-- 命令行：标准输入读取 JSON，标准输出 JSON。
+- 核心模块：`gov_tally.py`（`tally_proposal` / `verify_tally` /
+  `build_review_package` / 异常类）。
+- 命令行：无参数从标准输入读取计票 JSON；`review` 子命令读取复核输入。
+  标准输出均为 JSON。
 
 ## 状态
 
 已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核、
-可选权重来源追踪（`include_provenance`）、可选门槛判定（`decision_rules`）与 CLI。
+可选权重来源追踪（`include_provenance`）、可选门槛判定（`decision_rules`）、
+独立结果复核包（`build_review_package` / `review` 子命令）与 CLI。
 
 ## 安装与运行
 
 无需安装。要求 Python 3.12+。
 
 ```bash
+# 原计票：行为与字段保持不变
 cat proposal.json | python3 gov_tally.py
+
+# 独立结果复核
+cat review.json | python3 gov_tally.py review
 ```
 
-- 成功：退出码 `0`，标准输出为结果 JSON。
+- 成功：退出码 `0`，标准输出为结果 JSON（复核包见下文）。
 - 失败：退出码 `2`，标准输出为 `{"error": 异常类名, "message": 稳定描述}`，不输出 traceback。
+- 不接受除 `review` 之外的参数；多余参数按 `InvalidInputError` 处理。
+- 两种模式都只读写标准输入/标准输出，不落盘。
 
 ## 输入格式
 
@@ -170,15 +179,68 @@ verify_tally(input_data, result, include_provenance=True)
 来源至多归属一张计票；缺失、额外、乱序、错配、重复归属、非整数或非正来源权重均抛
 `TallyVerificationError`。为 `false` 时结果中的额外字段不受约束。
 
+## 结果复核（review）
+
+`python3 gov_tally.py review` 从标准输入读取**恰好**含以下六个字段的 JSON 对象，
+输出独立复核包；字段缺失或多余（含 `delegation_override`、`decision_rules`、
+`choices`）、JSON 非法或根不是对象均报 `InvalidInputError`。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `proposal_id` | string | 提案字符串 |
+| `snapshot_block` | int | 非负整数区块 |
+| `snapshot` | object | account -> 非负整数权重 |
+| `votes` | object[] | 选票列表，每项含字符串 `voter`、`choice` |
+| `delegations` | object | account -> 受托账户，逐跳解析 |
+| `claimed_result` | object | 待核对结果，只允许公开结果字段 |
+
+复核沿用公开计票语义：逐跳解析委托，把权重归到投票受托人并按选项累计，
+再把快照总权重汇总为直接参与、委托参与、未参与三类；review 不设覆盖票，
+`delegation_override` 与 `decision_rules` 不进入复核。
+
+输出字段固定顺序：
+
+| 字段 | 说明 |
+| --- | --- |
+| `proposal_id` / `snapshot_block` | 与输入一致 |
+| `results_by_choice` | 各选项计入权重，选项集合只由选票派生，按 choice 排序 |
+| `direct_participated_weight` | 已投票受托人本人权重之和 |
+| `delegated_weight` | 经有效委托汇入已投票受托人的权重之和 |
+| `non_participated_weight` | 受托人未投票（含未委托未投票）账户的权重之和 |
+| `effective_delegations` | 实际把票权送达已投票受托人的委托明细，按 delegator 排序，每项含 `delegator`、`trustee`、`weight` |
+| `weight_conservation_holds` | 三类权重之和是否等于快照权重总和 |
+| `review_status` | 全部一致为 `"matched"`，否则 `"mismatched"` |
+| `field_differences` | 逐项差异列表，每项含 `field`、`computed`、`claimed`；字段缺失时 `claimed` 为 `null` |
+
+待核对结果允许的字段（逐项比对，顺序固定）：`proposal_id`、`snapshot_block`、
+`results_by_choice`、`direct_participated_weight`、`delegated_weight`、
+`non_participated_weight`。叶子值缺失、`null`、类型或取值错误不抛异常，逐项列为差异；
+`results_by_choice` 的选项集合或任一权重不同算该字段的一项差异（比对前按选项名排序，
+键序不同不算差异）。
+
+Python 也可直接调用：
+
+```python
+from gov_tally import review_package_from_input, build_review_package
+
+pkg = review_package_from_input(review_input_dict)  # 含顶层六字段契约校验
+pkg = build_review_package(proposal_id, snapshot_block, snapshot,
+                           votes, delegations, claimed_result)
+```
+
 ## 异常
 
 | 异常类 | 触发条件 |
 | --- | --- |
-| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override`、`include_provenance` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON；`decision_rules` 非对象、字段缺失或多余、`approval_choices` 类型/成员非法或空/重复，或 `min_counted_weight`、`approval_basis_points` 类型或范围非法（布尔值不算整数） |
+| `InvalidInputError` | 字段缺失、类型错误（含 `delegation_override`、`include_provenance` 非布尔）、权重非整数或为负、`choices` 为空或重复、输入不是合法 JSON；`decision_rules` 非对象、字段缺失或多余、`approval_choices` 类型/成员非法或空/重复，或 `min_counted_weight`、`approval_basis_points` 类型或范围非法（布尔值不算整数）；review 输入顶层字段缺失或多余、根不是对象、命令行参数未知或多余 |
 | `InvalidDelegationError` | `delegations` 的委托方或受托方不在 `snapshot` 中 |
 | `DelegationCycleError` | 委托链成环且无法到达最终受托人 |
 | `InvalidVoteError` | voter 重复、普通票来自已委托他人者、覆盖票来自未委托他人者、voter 不在 snapshot、choice 不在 choices |
 | `TallyVerificationError` | `verify_tally` 复核不一致 |
+| `SnapshotIntegrityError` | review 快照输入不合法：`proposal_id` 非字符串、`snapshot_block` 非非负整数（布尔不算整数）、`snapshot` 非对象、账户键非字符串或权重非非负整数 |
+| `BallotValidationError` | review 选票不合法：`votes` 非列表、选票非对象或缺 `voter`/`choice`、二者非字符串、投票者不在快照、同一账户多票，或已委托账户直接投票 |
+| `DelegationConflictError` | review 委托不合法：非对象（如可表达一账户多受托人的列表）、账户非字符串、引用快照外账户、自委托或委托链成环 |
+| `ClaimedResultValidationError` | `claimed_result` 非对象、含公开结果字段之外的未知字段，或 `results_by_choice` 非字符串键的对象 |
 
 错误输出中的 `message` 为确定性文本，不含内存地址。
 
