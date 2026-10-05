@@ -1574,5 +1574,501 @@ class CliDecisionRulesTests(unittest.TestCase):
                 self.assertEqual(out["error"], "InvalidInputError")
 
 
+class ReviewPackageTests(unittest.TestCase):
+    """build_review_package：独立结果复核包装配。"""
+
+    def build(self, claimed_result, **overrides):
+        data = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 2, "b": 3, "c": 4, "d": 5, "e": 7},
+            "votes": [{"voter": "c", "choice": "yes"}],
+            "delegations": {"a": "b", "b": "c", "d": "c"},
+        }
+        data.update(overrides)
+        return gt.build_review_package(
+            data["proposal_id"],
+            data["snapshot_block"],
+            data["snapshot"],
+            data["votes"],
+            data["delegations"],
+            claimed_result,
+        )
+
+    def claimed(self, **overrides):
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"yes": 14},
+            "direct_participated_weight": 4,
+            "delegated_weight": 10,
+            "non_participated_weight": 7,
+        }
+        claim.update(overrides)
+        return claim
+
+    def test_matched_success_package(self):
+        pkg = self.build(self.claimed())
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["field_differences"], [])
+        self.assertTrue(pkg["weight_conservation_holds"])
+        self.assertEqual(pkg["results_by_choice"], {"yes": 14})
+        self.assertEqual(pkg[  # a2 + b3 + d5 经委托汇入已投票受托人 c
+            "effective_delegations"
+        ], [
+            {"delegator": "a", "trustee": "c", "weight": 2},
+            {"delegator": "b", "trustee": "c", "weight": 3},
+            {"delegator": "d", "trustee": "c", "weight": 5},
+        ])
+        # 直接参与＝已投票受托人本人 4；未参与＝独立未投票者 e 的 7。
+        self.assertEqual(pkg["direct_participated_weight"], 4)
+        self.assertEqual(pkg["delegated_weight"], 10)
+        self.assertEqual(pkg["non_participated_weight"], 7)
+
+    def test_package_field_order_is_stable(self):
+        pkg = self.build(self.claimed())
+        self.assertEqual(
+            list(pkg.keys()),
+            [
+                "proposal_id",
+                "snapshot_block",
+                "results_by_choice",
+                "direct_participated_weight",
+                "delegated_weight",
+                "non_participated_weight",
+                "effective_delegations",
+                "weight_conservation_holds",
+                "review_status",
+                "field_differences",
+            ],
+        )
+
+    def test_multiple_choices_sorted_and_accumulated(self):
+        # c 支持、e 反对；a/b/d 的委托权重随 c 进 yes；e 是独立账户。
+        pkg = self.build(
+            self.claimed(
+                results_by_choice={"no": 7, "yes": 14},
+                direct_participated_weight=11,
+                non_participated_weight=0,
+            ),
+            votes=[
+                {"voter": "c", "choice": "yes"},
+                {"voter": "e", "choice": "no"},
+            ],
+        )
+        # 选项按词法排序确定输出，e 由未参与转为直接参与。
+        self.assertEqual(list(pkg["results_by_choice"].keys()), ["no", "yes"])
+        self.assertEqual(pkg["results_by_choice"], {"no": 7, "yes": 14})
+        self.assertEqual(pkg["direct_participated_weight"], 11)
+        self.assertEqual(pkg["non_participated_weight"], 0)
+        self.assertEqual(pkg["review_status"], "matched")
+
+    def test_abstain_like_choice_is_counted_as_participation(self):
+        # 现有语义：弃权也是一个选项，票权计入该选项且属于已参与票权；
+        # 选项集合只由投票记录派生，未被投出的选项不出现在结果中。
+        claim = self.claimed(
+            results_by_choice={"abstain": 14},
+            direct_participated_weight=4,
+            non_participated_weight=7,
+        )
+        pkg = self.build(
+            claim,
+            votes=[{"voter": "c", "choice": "abstain"}],
+        )
+        self.assertEqual(pkg["results_by_choice"], {"abstain": 14})
+        self.assertEqual(pkg["review_status"], "matched")
+
+    def test_empty_votes_zero_tally_package(self):
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {},
+            "direct_participated_weight": 0,
+            "delegated_weight": 0,
+            "non_participated_weight": 21,
+        }
+        pkg = self.build(claim, votes=[], delegations={})
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["results_by_choice"], {})
+        self.assertEqual(pkg["effective_delegations"], [])
+        self.assertEqual(pkg[  # 全部账户保留为未参与，不丢弃、不分配
+            "non_participated_weight"
+        ], 21)
+        self.assertTrue(pkg["weight_conservation_holds"])
+
+    def test_non_delegated_non_voting_accounts_kept_unparticipated(self):
+        # a->b，两人都没投票；独立账户 c/d/e 也没投。
+        claim = self.claimed(
+            results_by_choice={},
+            direct_participated_weight=0,
+            delegated_weight=0,
+            non_participated_weight=21,
+        )
+        pkg = self.build(claim, votes=[], delegations={"a": "b"})
+        self.assertEqual(pkg["review_status"], "matched")
+        # 委托结构存在但未送达任何已投票受托人，不进有效委托明细。
+        self.assertEqual(pkg["effective_delegations"], [])
+        self.assertEqual(pkg["non_participated_weight"], 21)
+
+    def test_delegated_weight_to_nonvoting_trustee_is_unparticipated(self):
+        # a->b->c，无人投票：委托权重不达已投票受托人，全部未参与。
+        claim = self.claimed(
+            results_by_choice={},
+            direct_participated_weight=0,
+            delegated_weight=0,
+            non_participated_weight=9,
+        )
+        pkg = self.build(
+            claim,
+            snapshot={"a": 2, "b": 3, "c": 4},
+            votes=[],
+            delegations={"a": "b", "b": "c"},
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["effective_delegations"], [])
+
+    def test_zero_weight_accounts_and_total(self):
+        # 零权重账户可投票（直接参与为 0），守恒仍成立；全部零权重时零票包有效。
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"yes": 0},
+            "direct_participated_weight": 0,
+            "delegated_weight": 0,
+            "non_participated_weight": 0,
+        }
+        pkg = self.build(
+            claim,
+            snapshot={"a": 0, "b": 0},
+            votes=[{"voter": "a", "choice": "yes"}],
+            delegations={},
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertTrue(pkg["weight_conservation_holds"])
+
+    def test_mismatched_reports_per_field_differences_in_field_order(self):
+        claim = self.claimed(
+            proposal_id="OTHER",
+            results_by_choice={"yes": 13},
+            delegated_weight=9,
+        )
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "mismatched")
+        self.assertEqual(
+            [d["field"] for d in pkg["field_differences"]],
+            ["proposal_id", "results_by_choice", "delegated_weight"],
+        )
+        first = pkg["field_differences"][0]
+        self.assertEqual(first["computed"], "p1")
+        self.assertEqual(first["claimed"], "OTHER")
+        rc = next(d for d in pkg["field_differences"] if d["field"] == "results_by_choice")
+        self.assertEqual(rc["computed"], {"yes": 14})
+        self.assertEqual(rc["claimed"], {"yes": 13})
+        dw = next(d for d in pkg["field_differences"] if d["field"] == "delegated_weight")
+        self.assertEqual(dw["computed"], 10)
+        self.assertEqual(dw["claimed"], 9)
+        # 一致的字段不出现在差异中。
+        fields = {d["field"] for d in pkg["field_differences"]}
+        self.assertNotIn("direct_participated_weight", fields)
+        self.assertNotIn("snapshot_block", fields)
+
+    def test_missing_claimed_field_is_difference_not_exception(self):
+        claim = self.claimed()
+        del claim["delegated_weight"]
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "mismatched")
+        diff = next(d for d in pkg["field_differences"] if d["field"] == "delegated_weight")
+        self.assertEqual(diff["computed"], 10)
+        self.assertIsNone(diff["claimed"])
+
+    def test_results_by_choice_extra_choice_is_mismatch(self):
+        # 计算结果只有 yes；待核对多出 abstain（语义不同，不是"未知字段"——
+        # 选项名不属于顶层字段白名单，未知字段只针对 claimed 顶层）。
+        pkg = self.build(self.claimed(results_by_choice={"yes": 14, "abstain": 0}))
+        self.assertEqual(pkg["review_status"], "mismatched")
+        self.assertEqual(
+            [d["field"] for d in pkg["field_differences"]],
+            ["results_by_choice"],
+        )
+        self.assertEqual(
+            pkg["field_differences"][0]["claimed"],
+            {"abstain": 0, "yes": 14},
+        )
+
+    def test_claimed_choice_order_normalized_in_difference(self):
+        # 多选项时待核对映射以反序构造；比对按选项名归一化排序，内容一致即 matched。
+        rev_claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"yes": 14, "no": 7},  # 与计算顺序 no,yes 相反
+            "direct_participated_weight": 11,
+            "delegated_weight": 10,
+            "non_participated_weight": 0,
+        }
+        pkg = self.build(
+            rev_claim,
+            votes=[
+                {"voter": "c", "choice": "yes"},
+                {"voter": "e", "choice": "no"},
+            ],
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["field_differences"], [])
+
+    def test_deterministic_across_repeated_calls(self):
+        claim = self.claimed()
+        pkg1 = self.build(json.loads(json.dumps(claim)))
+        pkg2 = self.build(json.loads(json.dumps(claim)))
+        self.assertEqual(
+            json.dumps(pkg1, ensure_ascii=False, sort_keys=False),
+            json.dumps(pkg2, ensure_ascii=False, sort_keys=False),
+        )
+        # 即使输入的 delegations/votes 顺序不同，有效委托按委托人排序。
+        pkg3 = self.build(
+            json.loads(json.dumps(claim)),
+            delegations={"d": "c", "b": "c", "a": "b"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        self.assertEqual(
+            [d["delegator"] for d in pkg3["effective_delegations"]],
+            ["a", "b", "d"],
+        )
+
+    def test_package_delivered_only_via_return_value(self):
+        # 调用前后模块自身不留状态；结果可 JSON 序列化（纯返回值交付的可观察保证）。
+        claim = json.loads(json.dumps(self.claimed()))
+        snapshot = dict(a=2, b=3, c=4, d=5, e=7)
+        votes = [{"voter": "c", "choice": "yes"}]
+        delegations = {"a": "b", "b": "c", "d": "c"}
+        before = {k: v for k, v in gt.__dict__.items() if not k.startswith("_")}
+        pkg = gt.build_review_package("p1", 42, snapshot, votes, delegations, claim)
+        after = {k: v for k, v in gt.__dict__.items() if not k.startswith("_")}
+        self.assertEqual(set(before), set(after))
+        json.dumps(pkg, ensure_ascii=False)
+
+    def test_effective_delegations_weights_sum_to_delegated_weight(self):
+        pkg = self.build(self.claimed())
+        self.assertEqual(
+            sum(item["weight"] for item in pkg["effective_delegations"]),
+            pkg["delegated_weight"],
+        )
+        # 明细受托人全部是已投票受托人，且没有自委托条目。
+        for item in pkg["effective_delegations"]:
+            self.assertNotEqual(item["delegator"], item["trustee"])
+            self.assertEqual(item["trustee"], "c")
+
+    def test_empty_claimed_zero_tally_lists_every_field(self):
+        # 空待核对结果 + 空投票：零票包有效，六个公开字段全部逐项列差异。
+        pkg = gt.build_review_package(
+            "p1", 0, {"a": 1, "b": 2}, [], {}, {}
+        )
+        self.assertEqual(pkg["review_status"], "mismatched")
+        self.assertEqual(
+            [d["field"] for d in pkg["field_differences"]],
+            [
+                "proposal_id",
+                "snapshot_block",
+                "results_by_choice",
+                "direct_participated_weight",
+                "delegated_weight",
+                "non_participated_weight",
+            ],
+        )
+        self.assertEqual(
+            [d["claimed"] for d in pkg["field_differences"]],
+            [None] * 6,
+        )
+
+    def test_conservation_flag_reflects_the_boolean_identity(self):
+        pkg = self.build(self.claimed())
+        expected_total = 2 + 3 + 4 + 5 + 7
+        self.assertTrue(pkg["weight_conservation_holds"])
+        self.assertEqual(
+            pkg["direct_participated_weight"]
+            + pkg["delegated_weight"]
+            + pkg["non_participated_weight"],
+            expected_total,
+        )
+
+
+class ReviewPackageErrorTests(unittest.TestCase):
+    def build(self, **overrides):
+        args = dict(
+            proposal_id="p1",
+            snapshot_block=42,
+            snapshot={"a": 2, "b": 3, "c": 4},
+            votes=[],
+            delegations={},
+            claimed_result={},
+        )
+        args.update(overrides)
+        return gt.build_review_package(**args)
+
+    def test_snapshot_integrity_errors(self):
+        with self.assertRaises(gt.SnapshotIntegrityError):
+            self.build(proposal_id=7)
+        with self.assertRaises(gt.SnapshotIntegrityError):
+            self.build(snapshot_block=-1)
+        with self.assertRaises(gt.SnapshotIntegrityError):
+            self.build(snapshot_block=True)
+        with self.assertRaises(gt.SnapshotIntegrityError):
+            self.build(snapshot="not-an-object")
+        with self.assertRaises(gt.SnapshotIntegrityError):
+            self.build(snapshot={1: 5})
+        for bad in (-1, 1.5, "3", None, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(gt.SnapshotIntegrityError):
+                    self.build(snapshot={"a": bad})
+
+    def test_ballot_validation_errors(self):
+        base_snapshot = {"a": 2, "b": 3, "c": 4}
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes="nope")
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes=[{}])
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes=[{"choice": "yes"}])
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes=[{"voter": "a"}])
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes=[{"voter": 9, "choice": "yes"}])
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes=[{"voter": "a", "choice": 7}])
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(votes=[{"voter": "z", "choice": "yes"}])
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                votes=[
+                    {"voter": "a", "choice": "yes"},
+                    {"voter": "a", "choice": "no"},
+                ]
+            )
+        # 已委托账户直接投票：直接投票与委托同时使用票权。
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                snapshot=base_snapshot,
+                delegations={"a": "b"},
+                votes=[{"voter": "a", "choice": "yes"}],
+            )
+
+    def test_delegation_conflict_errors(self):
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations="nope")
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations={1: "a"})
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations={"a": 1})
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations={"z": "a"})
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations={"a": "z"})
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations={"a": "a"})
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations={"a": "b", "b": "a"})
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(
+                delegations={"a": "b", "b": "c", "c": "a"}
+            )
+
+    def test_non_mapping_delegations_rejected(self):
+        # 委托关系必须是 account -> trustee 的映射；列表等容器（可表达
+        # 同一委托方指向多个受托人）在结构校验阶段直接拒绝。
+        with self.assertRaises(gt.DelegationConflictError):
+            self.build(delegations=[("a", "b"), ("a", "c")])
+
+    def test_claimed_leaf_value_of_wrong_type_is_a_difference(self):
+        # 叶子值类型错误不算结构契约违反：逐项差异返回，不抛异常。
+        correct = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"yes": 14},
+            "direct_participated_weight": 4,
+            "delegated_weight": 10,
+            "non_participated_weight": 7,
+        }
+        kwargs = dict(
+            snapshot={"a": 2, "b": 3, "c": 4, "d": 5, "e": 7},
+            delegations={"a": "b", "b": "c", "d": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        for bad_value in (-1, 1.5, "3", True, None):
+            with self.subTest(bad_value=bad_value):
+                claim = json.loads(json.dumps(correct))
+                claim["delegated_weight"] = bad_value
+                pkg = self.build(claimed_result=claim, **kwargs)
+                self.assertEqual(pkg["review_status"], "mismatched")
+                diff = next(
+                    d for d in pkg["field_differences"]
+                    if d["field"] == "delegated_weight"
+                )
+                self.assertEqual(diff["computed"], 10)
+                self.assertEqual(diff["claimed"], bad_value)
+
+    def test_claimed_result_validation_errors(self):
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result=[])
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result="x")
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result=None)
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result={"unknown_field": 1})
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result={"review_status": "matched"})
+        # results_by_choice 必须是字符串键的对象；叶子权重类型错是差异。
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result={"results_by_choice": []})
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(claimed_result={"results_by_choice": "yes"})
+
+    def test_claimed_results_by_choice_leaf_wrong_type_is_difference(self):
+        base = dict(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegations={"a": "b", "b": "c"},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        correct = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"yes": 9},
+            "direct_participated_weight": 4,
+            "delegated_weight": 5,
+            "non_participated_weight": 0,
+        }
+        for bad in (-1, "9", 9.0, True, None):
+            with self.subTest(bad=bad):
+                claim = json.loads(json.dumps(correct))
+                claim["results_by_choice"]["yes"] = bad
+                pkg = self.build(claimed_result=claim, **base)
+                self.assertEqual(pkg["review_status"], "mismatched")
+                diff = next(
+                    d for d in pkg["field_differences"]
+                    if d["field"] == "results_by_choice"
+                )
+                self.assertEqual(diff["claimed"], {"yes": bad})
+                self.assertEqual(diff["computed"], {"yes": 9})
+
+    def test_error_types_are_tally_errors_and_distinct(self):
+        for cls in (
+            gt.SnapshotIntegrityError,
+            gt.BallotValidationError,
+            gt.DelegationConflictError,
+            gt.ClaimedResultValidationError,
+        ):
+            self.assertTrue(issubclass(cls, gt.TallyError))
+        self.assertIsNot(gt.SnapshotIntegrityError, gt.BallotValidationError)
+
+    def test_partial_claimed_result_with_unknown_field_still_raises(self):
+        # 未知字段优先报错，即使其他字段都正确。
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(
+                snapshot={"a": 2, "b": 3, "c": 4, "d": 5, "e": 7},
+                delegations={"a": "b", "b": "c", "d": "c"},
+                votes=[{"voter": "c", "choice": "yes"}],
+                claimed_result={"proposal_id": "p1", "bogus": 0},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

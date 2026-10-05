@@ -10,6 +10,9 @@
 * 可选门槛判定（``decision_rules``）：结果在既有字段后增加
   ``quorum_met`` / ``approval_met`` / ``decision``；
 * ``verify_tally``：独立复核字段、归属、守恒、汇总与门槛判定；
+* ``build_review_package``：独立的结果复核包装配，把一次提案的计票输入、
+  有效委托、实际票权与待核对结果整理成确定性、可重复验证的返回对象
+  （``matched`` / ``mismatched`` 逐项差异，不隐式写入文件、数据库或日志）；
 * 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2。
 """
 
@@ -26,8 +29,13 @@ __all__ = [
     "DelegationCycleError",
     "InvalidVoteError",
     "TallyVerificationError",
+    "SnapshotIntegrityError",
+    "BallotValidationError",
+    "DelegationConflictError",
+    "ClaimedResultValidationError",
     "tally_proposal",
     "verify_tally",
+    "build_review_package",
 ]
 
 _RESULT_FIELDS = (
@@ -48,6 +56,30 @@ _DECISION_RULE_FIELDS = (
     "approval_basis_points",
 )
 _DECISIONS = ("no_quorum", "approved", "rejected")
+
+# 复核包输出字段的稳定顺序。
+_REVIEW_PACKAGE_FIELDS = (
+    "proposal_id",
+    "snapshot_block",
+    "results_by_choice",
+    "direct_participated_weight",
+    "delegated_weight",
+    "non_participated_weight",
+    "effective_delegations",
+    "weight_conservation_holds",
+    "review_status",
+    "field_differences",
+)
+
+# 待核对结果允许的公开结果字段及其在逐项差异中的确定顺序。
+_CLAIMED_RESULT_FIELDS = (
+    "proposal_id",
+    "snapshot_block",
+    "results_by_choice",
+    "direct_participated_weight",
+    "delegated_weight",
+    "non_participated_weight",
+)
 
 
 class TallyError(Exception):
@@ -73,6 +105,26 @@ class InvalidVoteError(TallyError):
 
 class TallyVerificationError(TallyError):
     """计票结果未通过独立复核。"""
+
+
+class SnapshotIntegrityError(TallyError):
+    """复核包快照输入不合法：账户标识缺失/重复/非字符串，或投票权非非负整数。"""
+
+
+class BallotValidationError(TallyError):
+    """复核包选票不合法：投票者不在快照、同一账户多票、选项非字符串，
+    或直接投票者已把票权委托给他人（直接投票与委托不得同时使用票权）。"""
+
+
+class DelegationConflictError(TallyError):
+    """复核包委托关系不合法：引用快照外账户、自委托、成环，
+    或一个账户指向多个受托人。"""
+
+
+class ClaimedResultValidationError(TallyError):
+    """待核对结果不是对象、含公开结果字段之外的未知字段，
+    或 results_by_choice 不是字符串键的对象。叶子值的类型或取值错误
+    不作为异常，按逐项差异（mismatched）返回。"""
 
 
 def _is_int(value: Any) -> bool:
@@ -607,6 +659,324 @@ def _verify_provenance(result: dict, expected: dict, effective_weights: dict) ->
             raise TallyVerificationError(
                 f"weight_provenance sum does not equal effective weight: {voter!r}"
             )
+
+
+def _validate_review_snapshot(
+    proposal_id: Any, snapshot_block: Any, snapshot: Any
+) -> dict[str, int]:
+    """校验复核包的提案标识、快照区块与快照账户权重。"""
+    if not isinstance(proposal_id, str):
+        raise SnapshotIntegrityError("review package 'proposal_id' must be a string")
+    if not _is_int(snapshot_block) or snapshot_block < 0:
+        raise SnapshotIntegrityError(
+            "review package 'snapshot_block' must be a non-negative integer"
+        )
+    if not isinstance(snapshot, dict):
+        raise SnapshotIntegrityError(
+            "review package 'snapshot' must be an object of account -> weight"
+        )
+    for account, weight in snapshot.items():
+        if not isinstance(account, str):
+            raise SnapshotIntegrityError("snapshot account identifiers must be strings")
+        if not _is_int(weight):
+            raise SnapshotIntegrityError(
+                f"snapshot weight must be an integer: {account!r}"
+            )
+        if weight < 0:
+            raise SnapshotIntegrityError(
+                f"snapshot weight must be non-negative: {account!r}"
+            )
+    # dict 键天然唯一；返回副本，避免调用方在计算期间变更输入影响确定性。
+    return dict(snapshot)
+
+
+def _validate_review_delegations(
+    delegations: Any, snapshot: dict[str, int]
+) -> dict[str, str]:
+    """校验委托关系：仅快照账户之间、无自委托、无环、每账户唯一受托。"""
+    if not isinstance(delegations, dict):
+        raise DelegationConflictError(
+            "review package 'delegations' must be an object of account -> trustee"
+        )
+    resolved: dict[str, str] = {}
+    for delegator, target in delegations.items():
+        if not isinstance(delegator, str) or not isinstance(target, str):
+            raise DelegationConflictError(
+                "delegation accounts and trustees must be strings"
+            )
+        if delegator not in snapshot:
+            raise DelegationConflictError(
+                f"delegating account not in snapshot: {delegator!r}"
+            )
+        if target not in snapshot:
+            raise DelegationConflictError(
+                f"delegation target not in snapshot: {target!r}"
+            )
+        if target == delegator:
+            raise DelegationConflictError(
+                f"self-delegation is not allowed: {delegator!r}"
+            )
+    # 结构校验通过后，逐跳解析最终受托人并在此处发现环；
+    # 继续沿用 _resolve_trustee 的既成环判定作为事实来源。
+    for account in snapshot:
+        try:
+            resolved[account] = _resolve_trustee(account, delegations)
+        except DelegationCycleError as exc:
+            raise DelegationConflictError(str(exc)) from exc
+    return resolved
+
+
+def _validate_review_votes(
+    votes: Any, snapshot: dict[str, int], delegations: dict[str, str]
+) -> list[dict[str, str]]:
+    """校验选票：对象列表、voter/choice 为字符串、voter 在快照内、
+    同一账户至多一票，且直接投票与委托不得同时给同一账户使用票权。"""
+    if not isinstance(votes, list):
+        raise BallotValidationError("review package 'votes' must be a list")
+    validated: list[dict[str, str]] = []
+    seen_voters: set[str] = set()
+    for index, vote in enumerate(votes):
+        if not isinstance(vote, dict):
+            raise BallotValidationError(f"votes[{index}] must be an object")
+        if "voter" not in vote or "choice" not in vote:
+            raise BallotValidationError(
+                f"votes[{index}] missing field: "
+                + ("'voter'" if "voter" not in vote else "'choice'")
+            )
+        voter = vote["voter"]
+        choice = vote["choice"]
+        if not isinstance(voter, str):
+            raise BallotValidationError(f"votes[{index}].voter must be a string")
+        if not isinstance(choice, str):
+            raise BallotValidationError(f"votes[{index}].choice must be a string")
+        if voter not in snapshot:
+            raise BallotValidationError(
+                f"voter not in snapshot: {voter!r}"
+            )
+        if voter in seen_voters:
+            raise BallotValidationError(f"duplicate voter: {voter!r}")
+        if voter in delegations:
+            raise BallotValidationError(
+                f"voter has delegated voting power to another account: {voter!r}"
+            )
+        seen_voters.add(voter)
+        validated.append({"voter": voter, "choice": choice})
+    return validated
+
+
+def _validate_claimed_result(claimed_result: Any, known_fields: tuple[str, ...]) -> dict:
+    """校验待核对结果的结构契约：必须为对象，只含公开字段，
+    且 results_by_choice（若给出）必须是字符串键的对象。
+
+    叶子值的类型与取值不在此处约束——任何与计算值不一致的取值
+    （含缺失、null、错误类型、负数）都按逐项差异处理，不抛异常；
+    计算结果本身也不读取待核对结果的任何字段。
+    """
+    if not isinstance(claimed_result, dict):
+        raise ClaimedResultValidationError("claimed result must be an object")
+    allowed = set(known_fields)
+    for field in claimed_result:
+        if field not in allowed:
+            raise ClaimedResultValidationError(
+                f"claimed result has unknown field: {field!r}"
+            )
+
+    claimed_by_choice = claimed_result.get("results_by_choice")
+    if claimed_by_choice is not None:
+        if not isinstance(claimed_by_choice, dict):
+            raise ClaimedResultValidationError(
+                "claimed 'results_by_choice' must be an object of choice -> weight"
+            )
+        for choice in claimed_by_choice:
+            if not isinstance(choice, str):
+                raise ClaimedResultValidationError(
+                    "claimed 'results_by_choice' keys must be choice strings"
+                )
+    return claimed_result
+
+
+def _strict_equal(left: Any, right: Any) -> bool:
+    """类型敏感的叶子相等比较：布尔不与整数等同（bool 是 int 子类），
+    整数不与浮点等同，与既有计票引擎拒绝 bool/float 权重的严格性一致。"""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if _is_int(left) or _is_int(right):
+        return _is_int(left) and _is_int(right) and left == right
+    return left == right
+
+
+def _review_field_differences(
+    computed: dict, claimed_result: dict, known_fields: tuple[str, ...]
+) -> list[dict]:
+    """按公开字段的固定顺序逐项比对，返回字段名、计算值与待核对值。
+
+    缺失字段以待核对值 ``None`` 记为差异；叶子值不做类型约束，任何
+    取值差异（含错误类型，如 ``9.0``、``True`` 或字符串）都逐项返回；
+    results_by_choice 的选项集合或任一权重不同都算该字段的一项差异，
+    比对前按选项名归一化排序。差异不是异常。
+    """
+    differences: list[dict] = []
+    for field in known_fields:
+        if field not in claimed_result:
+            differences.append(
+                {"field": field, "computed": computed[field], "claimed": None}
+            )
+            continue
+        claimed_value = claimed_result[field]
+        if field == "results_by_choice" and isinstance(claimed_value, dict):
+            # 结构校验已保证键为字符串；排序归一化使比对只依赖语义内容。
+            claimed_normalized = dict(sorted(claimed_value.items()))
+            computed_normalized = computed[field]
+            matches = (
+                set(claimed_normalized) == set(computed_normalized)
+                and all(
+                    _strict_equal(claimed_normalized[choice], computed_normalized[choice])
+                    for choice in computed_normalized
+                )
+            )
+            claimed_value = claimed_normalized
+            is_equal = matches
+        else:
+            is_equal = _strict_equal(claimed_value, computed[field])
+        if not is_equal:
+            differences.append(
+                {"field": field, "computed": computed[field], "claimed": claimed_value}
+            )
+    return differences
+
+
+def build_review_package(
+    proposal_id: str,
+    snapshot_block: int,
+    snapshot: dict,
+    votes: list,
+    delegations: dict,
+    claimed_result: Any,
+) -> dict:
+    """生成一次提案的独立结果复核包（纯函数，只通过返回值交付）。
+
+    输入为提案标识、快照区块、快照账户及其投票权、投票记录、委托关系与
+    待核对结果。沿用公开计票语义：按委托链把未直接投票账户的票权聚合到
+    唯一受托人，再按选项累计票权；直接投票与委托相互排斥，不设覆盖票。
+
+    输出字段固定顺序：``proposal_id`` / ``snapshot_block`` /
+    ``results_by_choice`` / ``direct_participated_weight`` /
+    ``delegated_weight`` / ``non_participated_weight`` /
+    ``effective_delegations`` / ``weight_conservation_holds`` /
+    ``review_status`` / ``field_differences``。
+
+    * 快照账户标识非字符串或不唯一、投票权非非负整数 ->
+      ``SnapshotIntegrityError``；
+    * 投票者不在快照、同一账户多票、已委托账户直接投票 ->
+      ``BallotValidationError``；
+    * 委托引用快照外账户、自委托、成环或一账户多受托人 ->
+      ``DelegationConflictError``；
+    * 待核对结果不是对象、含未知字段，或 results_by_choice 不是字符串键
+      对象 -> ``ClaimedResultValidationError``；叶子值缺失、null、错误
+      类型或取值错误不作为异常，按逐项差异返回；
+    * 字段值不一致不抛异常，``review_status`` 为 ``"mismatched"`` 并逐项
+      给出字段名、计算值与待核对值；全部一致为 ``"matched"``。
+
+    空投票集合生成有效的零票复核包；未委托且未投票账户保留为
+    ``non_participated_weight``，不丢弃、不分配给任何选项。
+    """
+    snapshot_weights = _validate_review_snapshot(
+        proposal_id, snapshot_block, snapshot
+    )
+    delegations = dict(delegations) if isinstance(delegations, dict) else delegations
+    trustee_of = _validate_review_delegations(delegations, snapshot_weights)
+    validated_votes = _validate_review_votes(
+        votes, snapshot_weights, delegations
+    )
+    claimed = _validate_claimed_result(claimed_result, _CLAIMED_RESULT_FIELDS)
+
+    # 选项只从投票记录派生并确定排序：计算结果不依赖待核对结果的任何字段。
+    choices = sorted({vote["choice"] for vote in validated_votes})
+    voting_trustees = {vote["voter"] for vote in validated_votes}
+
+    results_by_choice: dict[str, int] = {choice: 0 for choice in choices}
+    if choices:
+        # 复用公开计票入口的委托传播与累计规则作为事实来源；
+        # 入口前的校验已更严格，这里不应再产生既有异常，防御性翻译一次。
+        context = {
+            "proposal_id": proposal_id,
+            "choices": choices,
+            "votes": validated_votes,
+            "snapshot": snapshot_weights,
+            "delegations": delegations,
+        }
+        try:
+            tally = _compute(context)
+        except InvalidDelegationError as exc:
+            raise DelegationConflictError(str(exc)) from exc
+        except DelegationCycleError as exc:
+            raise DelegationConflictError(str(exc)) from exc
+        except InvalidVoteError as exc:
+            raise BallotValidationError(str(exc)) from exc
+        results_by_choice = dict(tally["per_choice"])
+
+    # 票权三分类（按快照账户逐个归属，恰好覆盖总票权一次）：
+    # 直接参与＝已投票受托人本人权重；受托＝经有效委托汇入已投票受托人的权重；
+    # 未参与＝受托人未投票（含未委托未投票）账户的权重。
+    direct_weight = 0
+    delegated_weight = 0
+    non_participated_weight = 0
+    for account, weight in snapshot_weights.items():
+        trustee = trustee_of[account]
+        if trustee == account:
+            if account in voting_trustees:
+                direct_weight += weight
+            else:
+                non_participated_weight += weight
+        elif trustee in voting_trustees:
+            delegated_weight += weight
+        else:
+            non_participated_weight += weight
+
+    # 有效委托明细：实际把票权送达已投票受托人的委托，按委托人排序，
+    # 受托人取委托链解析后的唯一最终受托人；权重求和等于 delegated_weight。
+    effective_delegations = [
+        {
+            "delegator": account,
+            "trustee": trustee_of[account],
+            "weight": snapshot_weights[account],
+        }
+        for account in sorted(snapshot_weights)
+        if trustee_of[account] != account
+        and trustee_of[account] in voting_trustees
+    ]
+
+    snapshot_total_weight = sum(snapshot_weights.values())
+    weight_conservation_holds = (
+        direct_weight + delegated_weight + non_participated_weight
+        == snapshot_total_weight
+    )
+
+    computed = {
+        "proposal_id": proposal_id,
+        "snapshot_block": snapshot_block,
+        "results_by_choice": results_by_choice,
+        "direct_participated_weight": direct_weight,
+        "delegated_weight": delegated_weight,
+        "non_participated_weight": non_participated_weight,
+    }
+    field_differences = _review_field_differences(
+        computed, claimed, _CLAIMED_RESULT_FIELDS
+    )
+    review_status = "matched" if not field_differences else "mismatched"
+
+    return {
+        "proposal_id": proposal_id,
+        "snapshot_block": snapshot_block,
+        "results_by_choice": results_by_choice,
+        "direct_participated_weight": direct_weight,
+        "delegated_weight": delegated_weight,
+        "non_participated_weight": non_participated_weight,
+        "effective_delegations": effective_delegations,
+        "weight_conservation_holds": weight_conservation_holds,
+        "review_status": review_status,
+        "field_differences": field_differences,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
