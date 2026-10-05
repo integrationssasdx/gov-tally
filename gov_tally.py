@@ -12,7 +12,12 @@
 * ``verify_tally``：独立复核字段、归属、守恒、汇总与门槛判定；
 * ``build_review_package``：独立的结果复核包装配，把一次提案的计票输入、
   有效委托、实际票权与待核对结果整理成确定性、可重复验证的返回对象
-  （``matched`` / ``mismatched`` 逐项差异，不隐式写入文件、数据库或日志）；
+  （``matched`` / ``mismatched`` 逐项差异，不隐式写入文件、数据库或日志）。
+  复核输入可选 ``choices``（给出完整选项，未投票选项计 0 并按名称排序，
+  省略时选项从投票派生）、选票可选 ``delegation_override``（已委托他人者
+  亲自投出本人权重，其经转发的上游权重仍归最终受托人）与可选
+  ``decision_rules``（存在时必须同时给 ``choices``，输出在现有字段后追加
+  ``quorum_met`` / ``approval_met`` / ``decision`` 并逐项比对 claimed_result）；
 * 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2；
   无参数按提案计票输入处理，``review`` 子命令按复核包输入处理。
 """
@@ -82,7 +87,7 @@ _CLAIMED_RESULT_FIELDS = (
     "non_participated_weight",
 )
 
-# review 子命令输入对象必须恰好包含的字段。
+# review 子命令输入对象必须包含的字段。
 _REVIEW_INPUT_FIELDS = (
     "proposal_id",
     "snapshot_block",
@@ -91,6 +96,9 @@ _REVIEW_INPUT_FIELDS = (
     "delegations",
     "claimed_result",
 )
+
+# review 子命令输入对象允许包含的可选字段（choices / decision_rules）。
+_REVIEW_OPTIONAL_INPUT_FIELDS = ("choices", "decision_rules")
 
 
 class TallyError(Exception):
@@ -124,7 +132,8 @@ class SnapshotIntegrityError(TallyError):
 
 class BallotValidationError(TallyError):
     """复核包选票不合法：投票者不在快照、同一账户多票、选项非字符串，
-    或直接投票者已把票权委托给他人（直接投票与委托不得同时使用票权）。"""
+    普通票来自已委托他人者，或覆盖票（``delegation_override`` 为 true）
+    来自未委托他人者（含 ``delegation_override`` 取值非布尔）。"""
 
 
 class DelegationConflictError(TallyError):
@@ -738,13 +747,20 @@ def _validate_review_delegations(
 
 
 def _validate_review_votes(
-    votes: Any, snapshot: dict[str, int], delegations: dict[str, str]
-) -> list[dict[str, str]]:
+    votes: Any,
+    snapshot: dict[str, int],
+    trustee_of: dict[str, str],
+) -> list[dict]:
     """校验选票：对象列表、voter/choice 为字符串、voter 在快照内、
-    同一账户至多一票，且直接投票与委托不得同时给同一账户使用票权。"""
+    同一账户至多一票；普通票只能由最终受托人（未委托他人者）投出，
+    覆盖票（``delegation_override`` 为 true）只能由已委托他人者投出。
+
+    ``delegation_override`` 省略或为 false 时按普通票处理；取值非布尔
+    属选票结构非法，报 ``BallotValidationError``。
+    """
     if not isinstance(votes, list):
         raise BallotValidationError("review package 'votes' must be a list")
-    validated: list[dict[str, str]] = []
+    validated: list[dict] = []
     seen_voters: set[str] = set()
     for index, vote in enumerate(votes):
         if not isinstance(vote, dict):
@@ -760,19 +776,63 @@ def _validate_review_votes(
             raise BallotValidationError(f"votes[{index}].voter must be a string")
         if not isinstance(choice, str):
             raise BallotValidationError(f"votes[{index}].choice must be a string")
+        override = vote.get("delegation_override", False)
+        if not isinstance(override, bool):
+            raise BallotValidationError(
+                f"votes[{index}].delegation_override must be a boolean"
+            )
         if voter not in snapshot:
             raise BallotValidationError(
                 f"voter not in snapshot: {voter!r}"
             )
         if voter in seen_voters:
             raise BallotValidationError(f"duplicate voter: {voter!r}")
-        if voter in delegations:
+        has_delegated = trustee_of[voter] != voter
+        if override and not has_delegated:
+            raise BallotValidationError(
+                f"override voter has not delegated to another account: {voter!r}"
+            )
+        if not override and has_delegated:
             raise BallotValidationError(
                 f"voter has delegated voting power to another account: {voter!r}"
             )
         seen_voters.add(voter)
-        validated.append({"voter": voter, "choice": choice})
+        normalized = {"voter": voter, "choice": choice}
+        if override:
+            normalized["delegation_override"] = True
+        validated.append(normalized)
     return validated
+
+
+def _validate_review_choices(choices: Any) -> list[str] | None:
+    """校验复核包的可选 ``choices``：非空、成员为字符串且无重复。
+
+    省略（键不存在）返回 None；显式给 null 也视为非法（必须是非空字符串列表）。
+    """
+    if not isinstance(choices, list):
+        raise InvalidInputError("review package 'choices' must be a list of strings")
+    if len(choices) == 0:
+        raise InvalidInputError("review package 'choices' must not be empty")
+    seen: set[str] = set()
+    for choice in choices:
+        if not isinstance(choice, str):
+            raise InvalidInputError("every review package choice must be a string")
+        if choice in seen:
+            raise InvalidInputError(f"duplicate review package choice: {choice!r}")
+        seen.add(choice)
+    return list(choices)
+
+
+def _validate_review_decision_rules(
+    decision_rules: Any, choices: list[str]
+) -> dict | None:
+    """校验复核包的可选 ``decision_rules``。
+
+    规则的结构与取值约束与 ``tally_proposal`` 完全一致，复用其事实来源；
+    调用方负责保证提供 ``choices``（有规则而无选项在更早处报
+    InvalidInputError）。
+    """
+    return _validate_decision_rules(decision_rules, choices)
 
 
 def _validate_claimed_result(claimed_result: Any, known_fields: tuple[str, ...]) -> dict:
@@ -863,28 +923,60 @@ def build_review_package(
     votes: list,
     delegations: dict,
     claimed_result: Any,
+    choices: Any = _UNSET,
+    decision_rules: Any = _UNSET,
 ) -> dict:
     """生成一次提案的独立结果复核包（纯函数，只通过返回值交付）。
 
     输入为提案标识、快照区块、快照账户及其投票权、投票记录、委托关系与
     待核对结果。沿用公开计票语义：按委托链把未直接投票账户的票权聚合到
-    唯一受托人，再按选项累计票权；直接投票与委托相互排斥，不设覆盖票。
+    唯一受托人，再按选项累计票权。
+
+    可选 ``choices``：给出完整选项列表时，``results_by_choice`` 含全部选项
+    并按名称排序，未被投出的选项计 0；省略时选项集合从投票记录派生
+    （同样按名称排序）。选票可带 ``delegation_override``：省略或 false 为
+    普通票（只能由最终受托人投出），true 为覆盖票，只能由已委托他人者投出，
+    其本人权重直接计入所选选项且不再交给受托人，经其转发的上游他人权重
+    仍归最终受托人；扣除与选票顺序无关，每个账户至多一票。
+
+    可选 ``decision_rules``：存在时必须同时提供 ``choices``，校验与计算
+    完全沿用 ``tally_proposal``；复核包在现有字段之后、``review_status``
+    之前追加 ``quorum_met`` / ``approval_met`` / ``decision``，并把这三个
+    字段纳入与 ``claimed_result`` 的逐项比对。无规则时
+    ``claimed_result`` 中出现门槛字段报 ``ClaimedResultValidationError``。
 
     输出字段固定顺序：``proposal_id`` / ``snapshot_block`` /
     ``results_by_choice`` / ``direct_participated_weight`` /
     ``delegated_weight`` / ``non_participated_weight`` /
     ``effective_delegations`` / ``weight_conservation_holds`` /
+    [``quorum_met`` / ``approval_met`` / ``decision``（仅有规则时）] /
     ``review_status`` / ``field_differences``。
 
-    * 快照账户标识非字符串或不唯一、投票权非非负整数 ->
-      ``SnapshotIntegrityError``；
-    * 投票者不在快照、同一账户多票、已委托账户直接投票 ->
-      ``BallotValidationError``；
+    票权三分类按快照账户逐个归属，恰好覆盖总票权一次并守恒：
+
+    * ``direct_participated_weight``：投票者本人权重——普通票为已投票
+      受托人本人权重，覆盖票为覆盖投票者本人权重（即使最终受托人未投票，
+      覆盖者本人权重也属直接参与）；
+    * ``delegated_weight``：经有效委托送达已投票受托人的他人权重；
+      覆盖者经其转发的上游权重按来源账户计入此项，覆盖者本人权重不计；
+    * ``non_participated_weight``：其余权重（受托人未投票、覆盖后无人
+      接收的剩余合并权重等）。
+
+    ``effective_delegations`` 按 delegator 排序，只列实际把权重送达已投票
+    受托人的上游来源账户；覆盖者本人不列，其转发到已投票受托人的上游
+    账户按来源列入，受托人取委托链解析后的唯一最终受托人。
+
+    * 顶层结构、``choices``、``decision_rules`` 非法 -> ``InvalidInputError``；
+    * 快照账户标识非字符串、投票权非非负整数 -> ``SnapshotIntegrityError``；
+    * 投票者不在快照、同一账户多票、选项非字符串、普通票来自已委托他人者、
+      覆盖票来自未委托他人者、``delegation_override`` 非布尔或投票选项不在
+      ``choices`` -> ``BallotValidationError``；
     * 委托引用快照外账户、自委托、成环或一账户多受托人 ->
       ``DelegationConflictError``；
-    * 待核对结果不是对象、含未知字段，或 results_by_choice 不是字符串键
-      对象 -> ``ClaimedResultValidationError``；叶子值缺失、null、错误
-      类型或取值错误不作为异常，按逐项差异返回；
+    * 待核对结果不是对象、含与当前配置不符的未知字段（含无规则时出现门槛
+      字段），或 results_by_choice 不是字符串键对象 ->
+      ``ClaimedResultValidationError``；叶子值缺失、null、错误类型或取值
+      错误不作为异常，按逐项差异返回；
     * 字段值不一致不抛异常，``review_status`` 为 ``"mismatched"`` 并逐项
       给出字段名、计算值与待核对值；全部一致为 ``"matched"``。
 
@@ -896,26 +988,62 @@ def build_review_package(
     )
     delegations = dict(delegations) if isinstance(delegations, dict) else delegations
     trustee_of = _validate_review_delegations(delegations, snapshot_weights)
+
+    # decision_rules 存在时必须同时提供 choices；choices 结构非法在此一并拒绝。
+    # 显式传入 null 等非法值按 InvalidInputError 处理（与 tally_proposal 一致），
+    # 因此用键存在（_UNSET 哨兵）而非真值判断。
+    explicit_choices: list[str] | None = None
+    if choices is not _UNSET:
+        explicit_choices = _validate_review_choices(choices)
+    validated_rules: dict | None = None
+    if decision_rules is not _UNSET:
+        if explicit_choices is None:
+            raise InvalidInputError(
+                "review package 'decision_rules' requires 'choices'"
+            )
+        validated_rules = _validate_review_decision_rules(
+            decision_rules, explicit_choices
+        )
+
     validated_votes = _validate_review_votes(
-        votes, snapshot_weights, delegations
+        votes, snapshot_weights, trustee_of
     )
-    claimed = _validate_claimed_result(claimed_result, _CLAIMED_RESULT_FIELDS)
 
-    # 选项只从投票记录派生并确定排序：计算结果不依赖待核对结果的任何字段。
-    choices = sorted({vote["choice"] for vote in validated_votes})
-    voting_trustees = {vote["voter"] for vote in validated_votes}
+    # 有显式选项时，投票选项必须全部在 choices 内（结构校验后的选票级非法）。
+    if explicit_choices is not None:
+        choice_set = set(explicit_choices)
+        for vote in validated_votes:
+            if vote["choice"] not in choice_set:
+                raise BallotValidationError(
+                    f"choice not in choices: {vote['choice']!r}"
+                )
 
-    results_by_choice: dict[str, int] = {choice: 0 for choice in choices}
-    if choices:
-        # 复用公开计票入口的委托传播与累计规则作为事实来源；
+    known_fields = _CLAIMED_RESULT_FIELDS
+    if validated_rules is not None:
+        known_fields = known_fields + _DECISION_FIELDS
+    claimed = _validate_claimed_result(claimed_result, known_fields)
+
+    # 选项集合：显式 choices 全量保留（未投票者计 0），否则从投票派生；
+    # 一律按名称排序，计算结果不依赖待核对结果的任何字段。
+    if explicit_choices is not None:
+        tally_choices = sorted(explicit_choices)
+    else:
+        tally_choices = sorted({vote["choice"] for vote in validated_votes})
+
+    results_by_choice: dict[str, int] = {choice: 0 for choice in tally_choices}
+    tally: dict = {}
+    if tally_choices:
+        # 复用公开计票入口的委托传播、覆盖扣除与累计规则作为事实来源；
         # 入口前的校验已更严格，这里不应再产生既有异常，防御性翻译一次。
         context = {
             "proposal_id": proposal_id,
-            "choices": choices,
+            "choices": tally_choices,
             "votes": validated_votes,
             "snapshot": snapshot_weights,
             "delegations": delegations,
         }
+        if validated_rules is not None:
+            context["decision_rules"] = validated_rules
         try:
             tally = _compute(context)
         except InvalidDelegationError as exc:
@@ -926,15 +1054,29 @@ def build_review_package(
             raise BallotValidationError(str(exc)) from exc
         results_by_choice = dict(tally["per_choice"])
 
+    override_voters = {
+        vote["voter"]
+        for vote in validated_votes
+        if vote.get("delegation_override", False)
+    }
+    voting_trustees = {
+        vote["voter"]
+        for vote in validated_votes
+        if not vote.get("delegation_override", False)
+    }
+
     # 票权三分类（按快照账户逐个归属，恰好覆盖总票权一次）：
-    # 直接参与＝已投票受托人本人权重；受托＝经有效委托汇入已投票受托人的权重；
-    # 未参与＝受托人未投票（含未委托未投票）账户的权重。
+    # 直接参与＝覆盖投票者本人，或受托人本人且其投了普通票；
+    # 受托＝非覆盖账户经委托汇入已投票受托人（覆盖者转发的上游按来源归此）；
+    # 未参与＝其余权重（含覆盖者本人权重被抽走后、无受托人接收的剩余部分）。
     direct_weight = 0
     delegated_weight = 0
     non_participated_weight = 0
     for account, weight in snapshot_weights.items():
         trustee = trustee_of[account]
-        if trustee == account:
+        if account in override_voters:
+            direct_weight += weight
+        elif trustee == account:
             if account in voting_trustees:
                 direct_weight += weight
             else:
@@ -944,8 +1086,9 @@ def build_review_package(
         else:
             non_participated_weight += weight
 
-    # 有效委托明细：实际把票权送达已投票受托人的委托，按委托人排序，
-    # 受托人取委托链解析后的唯一最终受托人；权重求和等于 delegated_weight。
+    # 有效委托明细：实际把票权送达已投票受托人的上游来源账户，按委托人排序。
+    # 覆盖者本人权重不列入（即使其最终受托人投了票）；覆盖者经链转发的上游
+    # 账户（如 a -> b -> c 中覆盖者 b 的上游 a）仍按来源列入，受托人取最终受托人。
     effective_delegations = [
         {
             "delegator": account,
@@ -953,7 +1096,8 @@ def build_review_package(
             "weight": snapshot_weights[account],
         }
         for account in sorted(snapshot_weights)
-        if trustee_of[account] != account
+        if account not in override_voters
+        and trustee_of[account] != account
         and trustee_of[account] in voting_trustees
     ]
 
@@ -971,12 +1115,8 @@ def build_review_package(
         "delegated_weight": delegated_weight,
         "non_participated_weight": non_participated_weight,
     }
-    field_differences = _review_field_differences(
-        computed, claimed, _CLAIMED_RESULT_FIELDS
-    )
-    review_status = "matched" if not field_differences else "mismatched"
 
-    return {
+    package = {
         "proposal_id": proposal_id,
         "snapshot_block": snapshot_block,
         "results_by_choice": results_by_choice,
@@ -985,9 +1125,30 @@ def build_review_package(
         "non_participated_weight": non_participated_weight,
         "effective_delegations": effective_delegations,
         "weight_conservation_holds": weight_conservation_holds,
-        "review_status": review_status,
-        "field_differences": field_differences,
     }
+
+    if validated_rules is not None:
+        computed.update(
+            {
+                "quorum_met": tally["quorum_met"],
+                "approval_met": tally["approval_met"],
+                "decision": tally["decision"],
+            }
+        )
+        package.update(
+            {
+                "quorum_met": tally["quorum_met"],
+                "approval_met": tally["approval_met"],
+                "decision": tally["decision"],
+            }
+        )
+
+    field_differences = _review_field_differences(computed, claimed, known_fields)
+    review_status = "matched" if not field_differences else "mismatched"
+
+    package["review_status"] = review_status
+    package["field_differences"] = field_differences
+    return package
 
 
 def _read_stdin_json() -> Any:
@@ -1002,9 +1163,10 @@ def _read_stdin_json() -> Any:
 def _run_review_cli() -> dict:
     """review 子命令：stdin 读取复核包输入，校验后装配复核包。
 
-    输入必须是恰好含 ``_REVIEW_INPUT_FIELDS`` 六个字段的 JSON 对象；
-    缺字段、多字段、非法 JSON 或输入非对象均报 InvalidInputError，
-    各字段的取值校验由 build_review_package 按既有规则完成。
+    输入必须是含 ``_REVIEW_INPUT_FIELDS`` 六个必备字段的 JSON 对象，
+    可另含可选的 ``choices`` 与 ``decision_rules``；缺必备字段、多未知字段、
+    非法 JSON 或输入非对象均报 InvalidInputError，各字段的取值校验由
+    build_review_package 按既有规则完成。
     """
     data = _read_stdin_json()
     if not isinstance(data, dict):
@@ -1012,8 +1174,9 @@ def _run_review_cli() -> dict:
     for field in _REVIEW_INPUT_FIELDS:
         if field not in data:
             raise InvalidInputError(f"missing field: {field!r}")
+    allowed = set(_REVIEW_INPUT_FIELDS) | set(_REVIEW_OPTIONAL_INPUT_FIELDS)
     for field in data:
-        if field not in _REVIEW_INPUT_FIELDS:
+        if field not in allowed:
             raise InvalidInputError(f"unexpected field: {field!r}")
     return build_review_package(
         data["proposal_id"],
@@ -1022,6 +1185,10 @@ def _run_review_cli() -> dict:
         data["votes"],
         data["delegations"],
         data["claimed_result"],
+        choices=data["choices"] if "choices" in data else _UNSET,
+        decision_rules=(
+            data["decision_rules"] if "decision_rules" in data else _UNSET
+        ),
     )
 
 
