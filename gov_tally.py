@@ -16,8 +16,15 @@
   可选 ``choices``（给出完整选项，含未投出的零票选项）、选票上的
   ``delegation_override``（已委托者亲自投出本人权重）与 ``decision_rules``
   （追加门槛判定字段并独立复核）；
+* 事件流入口 ``tally_proposal_from_events`` / ``verify_tally_from_events`` /
+  ``build_review_package_from_events``：以非负整数 ``snapshot_block`` 与
+  ``delegation_events``（``block`` / ``delegator`` / ``trustee`` 事件序列，
+  ``null`` 受托人表示清除委托）取代静态 ``delegations``，按序回放至快照时点，
+  再沿用逐跳解析、自委托、覆盖扣减、权重合并、来源与门槛规则计票；结果在
+  既有字段之后追加 ``snapshot_block`` 与 ``resolved_delegations``；
 * 命令行：标准输入读取 JSON，标准输出 JSON，异常退出码 2；
-  无参数按提案计票输入处理，``review`` 子命令按复核包输入处理。
+  无参数按提案计票输入处理，``review`` 子命令按复核包输入处理，
+  ``events`` / ``review-events`` 子命令按事件流输入处理。
 """
 
 from __future__ import annotations
@@ -37,9 +44,13 @@ __all__ = [
     "BallotValidationError",
     "DelegationConflictError",
     "ClaimedResultValidationError",
+    "DelegationEventError",
     "tally_proposal",
     "verify_tally",
     "build_review_package",
+    "tally_proposal_from_events",
+    "verify_tally_from_events",
+    "build_review_package_from_events",
 ]
 
 _RESULT_FIELDS = (
@@ -104,6 +115,38 @@ _REVIEW_INPUT_FIELDS = (
 )
 _REVIEW_OPTIONAL_INPUT_FIELDS = ("choices", "decision_rules")
 
+# 事件流计票结果在既有公开字段之后、门槛字段之前追加的两个字段。
+_EVENT_RESULT_EXTRA_FIELDS = ("snapshot_block", "resolved_delegations")
+
+# events 子命令输入：以 snapshot_block + delegation_events 取代 delegations；
+# include_provenance 与 decision_rules 沿用计票入口为可选字段。
+_EVENTS_INPUT_FIELDS = (
+    "proposal_id",
+    "choices",
+    "votes",
+    "snapshot",
+    "snapshot_block",
+    "delegation_events",
+)
+_EVENTS_OPTIONAL_INPUT_FIELDS = ("include_provenance", "decision_rules")
+
+# review-events 子命令输入：沿用 review 字段与 claimed_result，委托改用事件列表。
+_REVIEW_EVENTS_INPUT_FIELDS = (
+    "proposal_id",
+    "snapshot_block",
+    "snapshot",
+    "votes",
+    "delegation_events",
+    "claimed_result",
+)
+_REVIEW_EVENTS_OPTIONAL_INPUT_FIELDS = ("choices", "decision_rules")
+
+# 事件流复核包的待核对结果：公开字段末尾追加 resolved_delegations，
+# 有 decision_rules 时三个门槛字段仍在最后。
+_CLAIMED_RESULT_EVENT_FIELDS = _CLAIMED_RESULT_FIELDS + (
+    ("resolved_delegations",)
+)
+
 
 class TallyError(Exception):
     """所有计票异常的基类。"""
@@ -151,6 +194,15 @@ class ClaimedResultValidationError(TallyError):
     配置时含 quorum_met/approval_met/decision 三个门槛字段），
     或 results_by_choice 不是字符串键的对象。叶子值的类型或取值错误
     不作为异常，按逐项差异（mismatched）返回。"""
+
+
+class DelegationEventError(TallyError):
+    """委托事件流不合法：事件不是对象、字段缺失或多余，block 不是非负整数
+    或顺序递减，delegator/trustee 不是字符串或不在 snapshot，trustee 等于
+    delegator（非 null 自委托），或按序回放至快照时点后委托链成环。
+
+    晚于 snapshot_block 的事件不生效，也不参与校验。
+    """
 
 
 def _is_int(value: Any) -> bool:
@@ -223,20 +275,8 @@ def _validate_decision_rules(rules: Any, choices: list[str]) -> dict:
     return rules
 
 
-def _validate_input(data: Any):
-    """校验输入结构与类型，返回解包后的各字段。"""
-    if not isinstance(data, dict):
-        raise InvalidInputError("input must be a JSON object")
-
-    for field in ("proposal_id", "choices", "votes", "snapshot", "delegations"):
-        if field not in data:
-            raise InvalidInputError(f"missing field: {field!r}")
-
-    proposal_id = data["proposal_id"]
-    if not isinstance(proposal_id, str):
-        raise InvalidInputError("field 'proposal_id' must be a string")
-
-    choices = data["choices"]
+def _validate_choices(choices: Any) -> list[str]:
+    """校验 choices：非空字符串列表、无重复。"""
     if not isinstance(choices, list):
         raise InvalidInputError("field 'choices' must be a list")
     if len(choices) == 0:
@@ -248,8 +288,11 @@ def _validate_input(data: Any):
         if choice in seen_choices:
             raise InvalidInputError(f"duplicate choice: {choice!r}")
         seen_choices.add(choice)
+    return choices
 
-    votes = data["votes"]
+
+def _validate_votes_list(votes: Any) -> list:
+    """校验 votes：对象列表，每项含字符串 voter/choice 与可选布尔 override。"""
     if not isinstance(votes, list):
         raise InvalidInputError("field 'votes' must be a list")
     for index, vote in enumerate(votes):
@@ -268,8 +311,11 @@ def _validate_input(data: Any):
             raise InvalidInputError(
                 f"votes[{index}].delegation_override must be a boolean"
             )
+    return votes
 
-    snapshot = data["snapshot"]
+
+def _validate_snapshot_mapping(snapshot: Any) -> dict[str, int]:
+    """校验 snapshot：字符串账户 -> 非负整数权重（布尔不算整数）。"""
     if not isinstance(snapshot, dict):
         raise InvalidInputError("field 'snapshot' must be an object")
     for account, weight in snapshot.items():
@@ -279,6 +325,25 @@ def _validate_input(data: Any):
             raise InvalidInputError(f"snapshot weight for {account!r} must be an integer")
         if weight < 0:
             raise InvalidInputError(f"snapshot weight for {account!r} must be non-negative")
+    return snapshot
+
+
+def _validate_input(data: Any):
+    """校验输入结构与类型，返回解包后的各字段。"""
+    if not isinstance(data, dict):
+        raise InvalidInputError("input must be a JSON object")
+
+    for field in ("proposal_id", "choices", "votes", "snapshot", "delegations"):
+        if field not in data:
+            raise InvalidInputError(f"missing field: {field!r}")
+
+    proposal_id = data["proposal_id"]
+    if not isinstance(proposal_id, str):
+        raise InvalidInputError("field 'proposal_id' must be a string")
+
+    choices = _validate_choices(data["choices"])
+    votes = _validate_votes_list(data["votes"])
+    snapshot = _validate_snapshot_mapping(data["snapshot"])
 
     delegations = data["delegations"]
     if not isinstance(delegations, dict):
@@ -354,23 +419,206 @@ def _resolve_provenance_flag(data: dict, include_provenance: Any) -> bool:
     return include_provenance
 
 
-def _compute(data: Any, include_provenance: Any = _UNSET) -> dict:
+_DELEGATION_EVENT_FIELDS = frozenset(("block", "delegator", "trustee"))
+
+
+def _replay_delegation_events(
+    snapshot: dict[str, int], snapshot_block: int, events: Any
+) -> dict[str, str]:
+    """按序回放委托事件至快照时点，返回直接委托映射 ``delegator -> trustee``。
+
+    事件恰好含 ``block`` / ``delegator`` / ``trustee`` 三字段：
+
+    * ``block`` 为非负整数且全序列不得递减；同块后项覆盖前项；
+    * ``delegator`` 与非 null 的 ``trustee`` 必须是 snapshot 内的字符串账户；
+    * ``trustee`` 为 null 表示清除该委托方当前委托；
+    * 非 null ``trustee`` 不得等于 ``delegator``（自委托事件非法）；
+    * 仅 ``block <= snapshot_block`` 的事件参与状态折叠，之后事件不生效，
+      但事件流本身仍须满足上述结构与顺序约束。
+
+    折叠完成后逐跳解析全部快照账户的最终受托人；成环抛 DelegationEventError。
+    """
+    if not isinstance(events, list):
+        raise DelegationEventError("field 'delegation_events' must be a list")
+
+    effective: dict[str, str] = {}
+    last_block: int | None = None
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise DelegationEventError(
+                f"delegation_events[{index}] must be an object"
+            )
+        keys = set(event)
+        if keys != _DELEGATION_EVENT_FIELDS:
+            missing = _DELEGATION_EVENT_FIELDS - keys
+            if missing:
+                raise DelegationEventError(
+                    f"delegation_events[{index}] missing field: "
+                    f"{sorted(missing)[0]!r}"
+                )
+            extra = sorted(keys - _DELEGATION_EVENT_FIELDS)
+            raise DelegationEventError(
+                f"delegation_events[{index}] has unexpected field: {extra[0]!r}"
+            )
+
+        block = event["block"]
+        if not _is_int(block) or block < 0:
+            raise DelegationEventError(
+                f"delegation_events[{index}].block must be a non-negative integer"
+            )
+        if last_block is not None and block < last_block:
+            raise DelegationEventError(
+                f"delegation_events[{index}].block decreases from {last_block} "
+                f"to {block}"
+            )
+        last_block = block
+
+        delegator = event["delegator"]
+        if not isinstance(delegator, str):
+            raise DelegationEventError(
+                f"delegation_events[{index}].delegator must be a string"
+            )
+        if delegator not in snapshot:
+            raise DelegationEventError(
+                f"delegation_events[{index}].delegator not in snapshot: "
+                f"{delegator!r}"
+            )
+
+        trustee = event["trustee"]
+        if trustee is not None:
+            if not isinstance(trustee, str):
+                raise DelegationEventError(
+                    f"delegation_events[{index}].trustee must be a string or null"
+                )
+            if trustee not in snapshot:
+                raise DelegationEventError(
+                    f"delegation_events[{index}].trustee not in snapshot: "
+                    f"{trustee!r}"
+                )
+            if trustee == delegator:
+                raise DelegationEventError(
+                    f"delegation_events[{index}].trustee must not equal delegator: "
+                    f"{delegator!r}"
+                )
+
+        # 晚于快照时点的事件无效：仍须通过上面的结构与顺序校验，但不折叠状态。
+        if block > snapshot_block:
+            continue
+        if trustee is None:
+            effective.pop(delegator, None)
+        else:
+            effective[delegator] = trustee
+
+    # 结构与回放通过后再做成环判定（逐跳解析沿用静态委托的事实来源）。
+    for account in snapshot:
+        try:
+            _resolve_trustee(account, effective)
+        except DelegationCycleError as exc:
+            raise DelegationEventError(str(exc)) from exc
+    return effective
+
+
+def _resolved_delegations(
+    snapshot: dict[str, int], delegations: dict[str, str]
+) -> dict[str, str]:
+    """按 snapshot 顺序列各账户的最终受托人（无委托者为本人）。"""
+    return {
+        account: _resolve_trustee(account, delegations) for account in snapshot
+    }
+
+
+def _validate_events_input(data: Any):
+    """校验事件流计票输入（沿用提案字段，以 snapshot_block 与
+    delegation_events 取代 delegations），返回解包字段。"""
+    if not isinstance(data, dict):
+        raise InvalidInputError("input must be a JSON object")
+
+    for field in _EVENTS_INPUT_FIELDS:
+        if field not in data:
+            raise InvalidInputError(f"missing field: {field!r}")
+
+    proposal_id = data["proposal_id"]
+    if not isinstance(proposal_id, str):
+        raise InvalidInputError("field 'proposal_id' must be a string")
+
+    choices = _validate_choices(data["choices"])
+    votes = _validate_votes_list(data["votes"])
+    snapshot = _validate_snapshot_mapping(data["snapshot"])
+
+    snapshot_block = data["snapshot_block"]
+    if not _is_int(snapshot_block) or snapshot_block < 0:
+        raise InvalidInputError(
+            "field 'snapshot_block' must be a non-negative integer"
+        )
+
+    decision_rules = None
+    if "decision_rules" in data:
+        decision_rules = _validate_decision_rules(
+            data["decision_rules"], choices
+        )
+
+    return (
+        proposal_id,
+        choices,
+        votes,
+        snapshot,
+        snapshot_block,
+        data["delegation_events"],
+        decision_rules,
+    )
+
+
+def _compute_from_events(
+    data: Any, include_provenance: Any = _UNSET
+) -> dict:
+    """事件流计票事实入口：校验、回放至快照时点，再沿用核心计票，
+    结果在基础字段之后追加 snapshot_block 与 resolved_delegations。"""
     (
         proposal_id,
         choices,
         votes,
         snapshot,
-        delegations,
+        snapshot_block,
+        events,
         decision_rules,
-    ) = _validate_input(data)
-    _check_delegation_accounts(snapshot, delegations)
+    ) = _validate_events_input(data)
     include_provenance = _resolve_provenance_flag(data, include_provenance)
+    delegations = _replay_delegation_events(
+        snapshot, snapshot_block, events
+    )
+    trustee_of = _resolved_delegations(snapshot, delegations)
+    return _tally_from_trustees(
+        proposal_id,
+        choices,
+        votes,
+        snapshot,
+        trustee_of,
+        decision_rules,
+        include_provenance,
+        extra_tail={
+            "snapshot_block": snapshot_block,
+            "resolved_delegations": trustee_of,
+        },
+    )
 
-    # 为每个快照账户解析最终受托人；环在此处即被发现，即使该账户未投票。
-    trustee_of = {
-        account: _resolve_trustee(account, delegations) for account in snapshot
-    }
 
+def _tally_from_trustees(
+    proposal_id: str,
+    choices: list[str],
+    votes: list[dict],
+    snapshot: dict[str, int],
+    trustee_of: dict[str, str],
+    decision_rules: dict | None,
+    include_provenance: bool,
+    extra_tail: dict | None = None,
+) -> dict:
+    """计票事实核心：输入快照与各账户的最终受托人映射（静态委托或事件回放
+    都在外部解析完毕），产出计票结果。
+
+    沿用逐跳解析后的自委托、覆盖扣减、权重合并、来源与门槛规则。
+    ``extra_tail`` 给出在 ``is_tie`` 之后、门槛字段之前追加的字段
+    （事件流入口用于追加 snapshot_block 与 resolved_delegations）。
+    """
     # 每个账户的快照权重只并入其最终受托人一次，不重复计数。
     bucket = {account: 0 for account in snapshot}
     for account, weight in snapshot.items():
@@ -460,11 +708,42 @@ def _compute(data: Any, include_provenance: Any = _UNSET) -> dict:
             "is_tie": is_tie,
         }
     )
+    # 事件流入口的 snapshot_block / resolved_delegations 追加在基础字段之后、
+    # 门槛字段之前。
+    if extra_tail is not None:
+        result.update(extra_tail)
     if decision_rules is not None:
         result.update(
             _decide(decision_rules, per_choice, counted_weight)
         )
     return result
+
+
+def _compute(data: Any, include_provenance: Any = _UNSET) -> dict:
+    (
+        proposal_id,
+        choices,
+        votes,
+        snapshot,
+        delegations,
+        decision_rules,
+    ) = _validate_input(data)
+    _check_delegation_accounts(snapshot, delegations)
+    include_provenance = _resolve_provenance_flag(data, include_provenance)
+
+    # 为每个快照账户解析最终受托人；环在此处即被发现，即使该账户未投票。
+    trustee_of = {
+        account: _resolve_trustee(account, delegations) for account in snapshot
+    }
+    return _tally_from_trustees(
+        proposal_id,
+        choices,
+        votes,
+        snapshot,
+        trustee_of,
+        decision_rules,
+        include_provenance,
+    )
 
 
 def _decide(
@@ -508,25 +787,9 @@ def tally_proposal(input_data: dict, include_provenance: Any = _UNSET) -> dict:
     return _compute(input_data, include_provenance)
 
 
-def verify_tally(
-    input_data: dict, result: Any, include_provenance: Any = _UNSET
-) -> bool:
-    """独立复核计票结果。
-
-    按覆盖语义独立重算，检查字段完整性、choice 顺序、权重归属
-    （覆盖票记本人权重、受托人记剩余合并权重、选票归属）、
-    权重守恒（counted + uncounted == snapshot_total）与汇总一致性。
-    ``include_provenance`` 为 True 时另复核 ``weight_provenance``
-    （存在性、内外层键及顺序、来源归属、来源值等于 snapshot 权重、
-    映射求和等于 effective_weights、同一来源至多归属一张计票）；
-    为 False 时结果中的额外字段不受约束。
-    输入含 ``decision_rules`` 时另复核 ``quorum_met`` /
-    ``approval_met`` / ``decision`` 的集合、尾部顺序、类型、取值与
-    决策一致性；无配置时结果不得含这些字段。
-    全部一致返回 True，否则抛 TallyVerificationError。
-    """
-    expected = _compute(input_data, include_provenance)
-
+def _verify_result_core(result: Any, expected: dict) -> dict:
+    """复核计票结果的基础字段：完整性、choice 顺序、权重归属、守恒、汇总、
+    赢家、并列与（启用时）来源映射。返回 result 字典。"""
     if not isinstance(result, dict):
         raise TallyVerificationError("result must be an object")
     for field in _RESULT_FIELDS:
@@ -590,8 +853,148 @@ def verify_tally(
     if "weight_provenance" in expected:
         _verify_provenance(result, expected, effective_weights)
 
-    _verify_decisions(result, expected)
+    return result
 
+
+def _verify_decision_values(result: dict, expected: dict) -> None:
+    """复核门槛字段的存在性（无配置时不得出现）、类型、取值与决策一致性；
+    不检查字段位置与整体键序。"""
+    if "decision" not in expected:
+        for field in _DECISION_FIELDS:
+            if field in result:
+                raise TallyVerificationError(
+                    f"unexpected field without decision_rules: {field!r}"
+                )
+        return
+
+    for field in _DECISION_FIELDS:
+        if field not in result:
+            raise TallyVerificationError(f"result missing field: {field!r}")
+
+    for field in ("quorum_met", "approval_met"):
+        value = result[field]
+        if not isinstance(value, bool):
+            raise TallyVerificationError(f"{field} must be a boolean")
+        if value != expected[field]:
+            raise TallyVerificationError(f"{field} mismatch")
+
+    decision = result["decision"]
+    if not isinstance(decision, str) or decision not in _DECISIONS:
+        raise TallyVerificationError("decision must be one of the decision labels")
+    if decision != expected["decision"]:
+        raise TallyVerificationError("decision mismatch")
+
+    # 决策必须与两个判定一致，不能出现标志与结论互相矛盾的组合。
+    if not result["quorum_met"]:
+        consistent = decision == "no_quorum"
+    elif result["approval_met"]:
+        consistent = decision == "approved"
+    else:
+        consistent = decision == "rejected"
+    if not consistent:
+        raise TallyVerificationError("decision is inconsistent with the thresholds")
+
+
+def verify_tally(
+    input_data: dict, result: Any, include_provenance: Any = _UNSET
+) -> bool:
+    """独立复核计票结果。
+
+    按覆盖语义独立重算，检查字段完整性、choice 顺序、权重归属
+    （覆盖票记本人权重、受托人记剩余合并权重、选票归属）、
+    权重守恒（counted + uncounted == snapshot_total）与汇总一致性。
+    ``include_provenance`` 为 True 时另复核 ``weight_provenance``
+    （存在性、内外层键及顺序、来源归属、来源值等于 snapshot 权重、
+    映射求和等于 effective_weights、同一来源至多归属一张计票）；
+    为 False 时结果中的额外字段不受约束。
+    输入含 ``decision_rules`` 时另复核 ``quorum_met`` /
+    ``approval_met`` / ``decision`` 的集合、尾部顺序、类型、取值与
+    决策一致性；无配置时结果不得含这些字段。
+    全部一致返回 True，否则抛 TallyVerificationError。
+    """
+    expected = _compute(input_data, include_provenance)
+    result = _verify_result_core(result, expected)
+    _verify_decisions(result, expected)
+    return True
+
+
+def tally_proposal_from_events(
+    input_data: dict, include_provenance: Any = _UNSET
+) -> dict:
+    """按委托事件流重建指定快照时点的计票。
+
+    输入沿用提案字段（``proposal_id`` / ``choices`` / ``votes`` /
+    ``snapshot`` / 可选 ``decision_rules``），以非负整数 ``snapshot_block``
+    与 ``delegation_events`` 取代 ``delegations``。事件按序生效：
+    ``block`` 不得递减，同块后项覆盖前项，``trustee`` 为 null 清除委托，
+    仅取 ``block <= snapshot_block`` 的最后状态，之后事件无效；事件字段、
+    block、账户、自委托或回放后成环非法时抛 DelegationEventError，投票与
+    门槛非法仍用 InvalidVoteError / InvalidInputError。
+
+    计票语义沿用静态入口：逐跳解析、自委托终止于本人、覆盖扣减、权重合并、
+    来源追踪与门槛规则。结果在既有字段之后追加 ``snapshot_block`` 与
+    ``resolved_delegations``（按 snapshot 顺序列各账户最终受托人）；
+    有 ``decision_rules`` 时门槛字段仍在最后。
+    """
+    return _compute_from_events(input_data, include_provenance)
+
+
+def _verify_event_extras(result: dict, expected: dict) -> None:
+    """复核事件流结果的 snapshot_block 与 resolved_delegations：存在性、
+    位置尾部追加、类型、取值与 snapshot 键序。"""
+    for field in _EVENT_RESULT_EXTRA_FIELDS:
+        if field not in result:
+            raise TallyVerificationError(f"result missing field: {field!r}")
+
+    snapshot_block = result["snapshot_block"]
+    if not _is_int(snapshot_block) or snapshot_block < 0:
+        raise TallyVerificationError(
+            "snapshot_block must be a non-negative integer"
+        )
+    if snapshot_block != expected["snapshot_block"]:
+        raise TallyVerificationError("snapshot_block mismatch")
+
+    resolved = result["resolved_delegations"]
+    expected_resolved = expected["resolved_delegations"]
+    if not isinstance(resolved, dict):
+        raise TallyVerificationError("resolved_delegations must be an object")
+    if list(resolved.keys()) != list(expected_resolved.keys()):
+        raise TallyVerificationError(
+            "resolved_delegations accounts or their order mismatch"
+        )
+    for account, trustee in resolved.items():
+        if not isinstance(trustee, str):
+            raise TallyVerificationError(
+                f"resolved trustee must be a string: {account!r}"
+            )
+        if trustee != expected_resolved[account]:
+            raise TallyVerificationError(
+                f"resolved trustee mismatch: {account!r}"
+            )
+
+
+def verify_tally_from_events(
+    input_data: dict, result: Any, include_provenance: Any = _UNSET
+) -> bool:
+    """独立复核事件流计票结果。
+
+    独立重放事件并按相同语义重算，复核基础字段与三类权重守恒、赢家、并列、
+    来源（启用时）与门槛判定，并复核尾部追加的 ``snapshot_block`` 与
+    ``resolved_delegations``（存在性、尾部位置、snapshot 顺序与最终受托人）。
+    结果字段集合与顺序必须与重算结果完全一致：缺失、乱序、多余或数值不符
+    均抛 TallyVerificationError；事件输入本身非法仍抛对应输入异常。
+    """
+    expected = _compute_from_events(input_data, include_provenance)
+    result = _verify_result_core(result, expected)
+    _verify_event_extras(result, expected)
+    _verify_decision_values(result, expected)
+
+    # 事件流结果形状固定：基础字段（含 provenance）后恰好追加
+    # snapshot_block、resolved_delegations，有门槛时三个字段在最后。
+    if list(result.keys()) != list(expected.keys()):
+        raise TallyVerificationError(
+            "result fields, their set or their order mismatch"
+        )
     return True
 
 
@@ -868,6 +1271,19 @@ def _validate_claimed_result(claimed_result: Any, known_fields: tuple[str, ...])
                 raise ClaimedResultValidationError(
                     "claimed 'results_by_choice' keys must be choice strings"
                 )
+
+    claimed_resolved = claimed_result.get("resolved_delegations")
+    if claimed_resolved is not None:
+        if not isinstance(claimed_resolved, dict):
+            raise ClaimedResultValidationError(
+                "claimed 'resolved_delegations' must be an object "
+                "of account -> trustee"
+            )
+        for account in claimed_resolved:
+            if not isinstance(account, str):
+                raise ClaimedResultValidationError(
+                    "claimed 'resolved_delegations' keys must be account strings"
+                )
     return claimed_result
 
 
@@ -899,15 +1315,18 @@ def _review_field_differences(
             )
             continue
         claimed_value = claimed_result[field]
-        if field == "results_by_choice" and isinstance(claimed_value, dict):
-            # 结构校验已保证键为字符串；排序归一化使比对只依赖语义内容。
+        if field in ("results_by_choice", "resolved_delegations") and isinstance(
+            claimed_value, dict
+        ):
+            # 结构校验已保证键为字符串；映射类字段按键名归一化排序，
+            # 使比对只依赖语义内容（resolved_delegations 的键为账户名）。
             claimed_normalized = dict(sorted(claimed_value.items()))
             computed_normalized = computed[field]
             matches = (
                 set(claimed_normalized) == set(computed_normalized)
                 and all(
-                    _strict_equal(claimed_normalized[choice], computed_normalized[choice])
-                    for choice in computed_normalized
+                    _strict_equal(claimed_normalized[key], computed_normalized[key])
+                    for key in computed_normalized
                 )
             )
             claimed_value = claimed_normalized
@@ -1000,6 +1419,45 @@ def build_review_package(
         known_fields = known_fields + _CLAIMED_DECISION_FIELDS
     claimed = _validate_claimed_result(claimed_result, known_fields)
 
+    return _assemble_review_package(
+        proposal_id=proposal_id,
+        snapshot_block=snapshot_block,
+        snapshot_weights=snapshot_weights,
+        validated_votes=validated_votes,
+        delegations=delegations,
+        trustee_of=trustee_of,
+        claimed=claimed,
+        validated_choices=validated_choices,
+        rules=rules,
+        known_fields=known_fields,
+        include_resolved=False,
+        delegation_error=DelegationConflictError,
+    )
+
+
+def _assemble_review_package(
+    *,
+    proposal_id: str,
+    snapshot_block: int,
+    snapshot_weights: dict[str, int],
+    validated_votes: list[dict],
+    delegations: dict[str, str],
+    trustee_of: dict[str, str],
+    claimed: dict,
+    validated_choices: list[str] | None,
+    rules: dict | None,
+    known_fields: tuple[str, ...],
+    include_resolved: bool,
+    delegation_error: type,
+) -> dict:
+    """复核包装配事实核心：静态委托与事件回放两类入口在校验完成后共用。
+
+    沿委托/回放结果聚合票权、分类三类权重、生成有效委托明细、逐项核对
+    claimed_result；``include_resolved`` 为真时另在末尾追加
+    resolved_delegations（按 snapshot 顺序列各账户最终受托人）。
+    ``delegation_error`` 给出防御性翻译计票入口委托异常时使用的异常类型
+    （静态委托用 DelegationConflictError，事件流用 DelegationEventError）。
+    """
     # 给出完整 choices 时含未投出的零票选项；否则从投票派生。一律按名称排序。
     if validated_choices is not None:
         tally_choices = sorted(validated_choices)
@@ -1036,9 +1494,9 @@ def build_review_package(
         try:
             tally = _compute(context)
         except InvalidDelegationError as exc:
-            raise DelegationConflictError(str(exc)) from exc
+            raise delegation_error(str(exc)) from exc
         except DelegationCycleError as exc:
-            raise DelegationConflictError(str(exc)) from exc
+            raise delegation_error(str(exc)) from exc
         except InvalidVoteError as exc:
             raise BallotValidationError(str(exc)) from exc
         results_by_choice = dict(tally["per_choice"])
@@ -1097,6 +1555,9 @@ def build_review_package(
         "delegated_weight": delegated_weight,
         "non_participated_weight": non_participated_weight,
     }
+    if include_resolved:
+        # 事件流复核包在既有公开字段之后追加各账户最终受托人（snapshot 顺序）。
+        computed["resolved_delegations"] = trustee_of
     computed.update(decision_values)
     field_differences = _review_field_differences(
         computed, claimed, known_fields
@@ -1115,9 +1576,86 @@ def build_review_package(
         "review_status": review_status,
         "field_differences": field_differences,
     }
+    if include_resolved:
+        package["resolved_delegations"] = trustee_of
     if rules is not None:
         package.update(decision_values)
     return package
+
+
+def build_review_package_from_events(
+    proposal_id: str,
+    snapshot_block: int,
+    snapshot: dict,
+    votes: list,
+    delegation_events: list,
+    claimed_result: Any,
+    choices: list[str] | None = None,
+    decision_rules: dict | None = None,
+) -> dict:
+    """按委托事件流重建快照时点并生成独立结果复核包（纯函数，只经返回值交付）。
+
+    输入沿用 ``build_review_package`` 的复核字段与 claimed_result，委托关系
+    改用 ``delegation_events`` 事件列表配合非负整数 ``snapshot_block``：
+    事件按序回放（block 不递减、同块后项覆盖前项、null 清除、仅取不大于
+    snapshot_block 的最后状态，之后事件无效），再沿用逐跳解析、自委托、
+    覆盖扣减、权重合并与门槛规则。事件字段缺失或多余、block 类型或顺序
+    非法、账户不在 snapshot、trustee 等于 delegator 或回放后委托链成环，
+    抛 DelegationEventError；其余校验异常与静态复核包一致。
+
+    输出保持静态复核包字段顺序，在 ``field_differences`` 之后追加
+    ``resolved_delegations``（按 snapshot 顺序列各账户最终受托人），有
+    ``decision_rules`` 时三个门槛字段仍在最后；claimed_result 允许的字段
+    集合同样在末尾加入 ``resolved_delegations``，三类权重守恒与逐项差异
+    规则不变。
+    """
+    snapshot_weights = _validate_review_snapshot(
+        proposal_id, snapshot_block, snapshot
+    )
+    effective_delegations = _replay_delegation_events(
+        snapshot_weights, snapshot_block, delegation_events
+    )
+    trustee_of = _resolved_delegations(
+        snapshot_weights, effective_delegations
+    )
+
+    validated_choices = _validate_review_choices(choices)
+    if decision_rules is not None and validated_choices is None:
+        raise InvalidInputError(
+            "review package 'decision_rules' requires 'choices' to be provided"
+        )
+    rules = None
+    if decision_rules is not None:
+        rules = _validate_decision_rules(decision_rules, validated_choices)
+    choice_set = (
+        set(validated_choices) if validated_choices is not None else None
+    )
+
+    # 回放后的直接委托映射无自委托键、无环：存在出边即代表最终受托人是他人，
+    # 与静态复核包 _validate_review_votes 的委托判定一致。
+    validated_votes = _validate_review_votes(
+        votes, snapshot_weights, effective_delegations, choice_set
+    )
+
+    known_fields = _CLAIMED_RESULT_EVENT_FIELDS
+    if rules is not None:
+        known_fields = known_fields + _CLAIMED_DECISION_FIELDS
+    claimed = _validate_claimed_result(claimed_result, known_fields)
+
+    return _assemble_review_package(
+        proposal_id=proposal_id,
+        snapshot_block=snapshot_block,
+        snapshot_weights=snapshot_weights,
+        validated_votes=validated_votes,
+        delegations=effective_delegations,
+        trustee_of=trustee_of,
+        claimed=claimed,
+        validated_choices=validated_choices,
+        rules=rules,
+        known_fields=known_fields,
+        include_resolved=True,
+        delegation_error=DelegationEventError,
+    )
 
 
 def _read_stdin_json() -> Any:
@@ -1166,11 +1704,80 @@ def _run_review_cli() -> dict:
     )
 
 
+def _run_events_cli() -> dict:
+    """events 子命令：stdin 读取事件流计票输入。
+
+    输入必须含 ``_EVENTS_INPUT_FIELDS`` 六个字段（以 snapshot_block 与
+    delegation_events 取代 delegations），可另含可选字段
+    include_provenance / decision_rules；缺必填、多未知（含 delegations）、
+    非法 JSON 或输入非对象均报 InvalidInputError，事件本身的非法由
+    tally_proposal_from_events 报 DelegationEventError。
+    """
+    data = _read_stdin_json()
+    if not isinstance(data, dict):
+        raise InvalidInputError("input must be a JSON object")
+    for field in _EVENTS_INPUT_FIELDS:
+        if field not in data:
+            raise InvalidInputError(f"missing field: {field!r}")
+    allowed = set(_EVENTS_INPUT_FIELDS) | set(_EVENTS_OPTIONAL_INPUT_FIELDS)
+    for field in data:
+        if field not in allowed:
+            raise InvalidInputError(f"unexpected field: {field!r}")
+    if "include_provenance" in data and not isinstance(
+        data["include_provenance"], bool
+    ):
+        raise InvalidInputError("include_provenance must be a boolean")
+    if "decision_rules" in data and not isinstance(
+        data["decision_rules"], dict
+    ):
+        raise InvalidInputError("field 'decision_rules' must be an object")
+    return tally_proposal_from_events(data)
+
+
+def _run_review_events_cli() -> dict:
+    """review-events 子命令：stdin 读取事件流复核包输入。
+
+    沿用 review 字段与 claimed_result，委托改用 delegation_events；
+    缺必填、多未知（含 delegations）、非法 JSON 或输入非对象报
+    InvalidInputError，其余校验由 build_review_package_from_events 完成。
+    """
+    data = _read_stdin_json()
+    if not isinstance(data, dict):
+        raise InvalidInputError("input must be a JSON object")
+    for field in _REVIEW_EVENTS_INPUT_FIELDS:
+        if field not in data:
+            raise InvalidInputError(f"missing field: {field!r}")
+    allowed = (
+        set(_REVIEW_EVENTS_INPUT_FIELDS)
+        | set(_REVIEW_EVENTS_OPTIONAL_INPUT_FIELDS)
+    )
+    for field in data:
+        if field not in allowed:
+            raise InvalidInputError(f"unexpected field: {field!r}")
+    if "choices" in data and not isinstance(data["choices"], list):
+        raise InvalidInputError("review package 'choices' must be a list")
+    if "decision_rules" in data and not isinstance(
+        data["decision_rules"], dict
+    ):
+        raise InvalidInputError("field 'decision_rules' must be an object")
+    return build_review_package_from_events(
+        data["proposal_id"],
+        data["snapshot_block"],
+        data["snapshot"],
+        data["votes"],
+        data["delegation_events"],
+        data["claimed_result"],
+        data.get("choices"),
+        data.get("decision_rules"),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """命令行入口：stdin JSON -> stdout JSON；成功退出 0，异常退出 2。
 
-    无参数时按提案计票输入处理；``review`` 子命令按复核包输入处理，
-    只新增输入输出路径，计票与复核语义不变。
+    无参数时按提案计票输入处理；``review`` 子命令按复核包输入处理；
+    ``events`` / ``review-events`` 分别按事件流计票/复核输入处理，
+    只新增输入输出路径，旧入口的字段顺序、异常、结果与退出码不变。
     """
     if argv is None:
         argv = sys.argv[1:]
@@ -1181,6 +1788,10 @@ def main(argv: list[str] | None = None) -> int:
             result = tally_proposal(_read_stdin_json())
         elif argv == ["review"]:
             result = _run_review_cli()
+        elif argv == ["events"]:
+            result = _run_events_cli()
+        elif argv == ["review-events"]:
+            result = _run_review_events_cli()
         else:
             raise InvalidInputError(f"unknown command: {argv[0]!r}")
     except TallyError as exc:

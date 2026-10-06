@@ -2770,5 +2770,953 @@ class CliReviewExtensionTests(unittest.TestCase):
         self.assertNotIn("review_status", out)
 
 
+def events_input(**overrides):
+    data = {
+        "proposal_id": "p1",
+        "choices": ["yes", "no"],
+        "votes": [],
+        "snapshot": {"a": 10, "b": 5},
+        "snapshot_block": 100,
+        "delegation_events": [],
+    }
+    data.update(overrides)
+    return data
+
+
+class TallyFromEventsTests(unittest.TestCase):
+    def chain_events(self):
+        return [
+            {"block": 1, "delegator": "a", "trustee": "b"},
+            {"block": 2, "delegator": "b", "trustee": "c"},
+        ]
+
+    def test_no_events_equals_self_delegation(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["per_choice"], {"yes": 4, "no": 0})
+        self.assertEqual(
+            result["resolved_delegations"], {"a": "a", "b": "b", "c": "c"}
+        )
+        self.assertEqual(result["snapshot_block"], 100)
+        self.assertEqual(
+            list(result.keys())[-2:], ["snapshot_block", "resolved_delegations"]
+        )
+
+    def test_chain_replayed_and_merged(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegation_events=self.chain_events(),
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["effective_weights"], {"c": 9})
+        self.assertEqual(result["per_choice"], {"yes": 9, "no": 0})
+        self.assertEqual(
+            result["resolved_delegations"], {"a": "c", "b": "c", "c": "c"}
+        )
+
+    def test_resolved_delegations_follows_snapshot_order(self):
+        data = events_input(
+            snapshot={"c": 4, "a": 2, "b": 3},
+            delegation_events=self.chain_events(),
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(
+            list(result["resolved_delegations"].keys()), ["c", "a", "b"]
+        )
+        self.assertEqual(
+            result["resolved_delegations"], {"c": "c", "a": "c", "b": "c"}
+        )
+
+    def test_events_after_snapshot_block_are_ignored(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            snapshot_block=5,
+            delegation_events=[
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "c"},
+                # 晚于快照时点：无效，既不改变状态也不参与成环。
+                {"block": 6, "delegator": "c", "trustee": "a"},
+            ],
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["per_choice"], {"yes": 9, "no": 0})
+        self.assertEqual(
+            result["resolved_delegations"], {"a": "c", "b": "c", "c": "c"}
+        )
+
+    def test_event_at_snapshot_block_takes_effect(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3},
+            snapshot_block=3,
+            delegation_events=[
+                {"block": 3, "delegator": "a", "trustee": "b"},
+                {"block": 4, "delegator": "a", "trustee": None},
+            ],
+            votes=[{"voter": "b", "choice": "yes"}],
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["effective_weights"], {"b": 5})
+
+    def test_null_trustee_clears_delegation(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegation_events=[
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "c"},
+                {"block": 3, "delegator": "b", "trustee": None},
+            ],
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        result = gt.tally_proposal_from_events(data)
+        # 清除后 b、c 各自为本人；a 仍委托到 b（a 的权重 2 随未投票的 b 未计票）。
+        self.assertEqual(
+            result["resolved_delegations"], {"a": "b", "b": "b", "c": "c"}
+        )
+        self.assertEqual(result["per_choice"], {"yes": 4, "no": 0})
+        self.assertEqual(result["counted_weight"], 4)
+        self.assertEqual(result["uncounted_weight"], 5)
+
+    def test_same_block_later_event_overrides_earlier(self):
+        base = events_input(
+            snapshot={"a": 2, "b": 3},
+            votes=[{"voter": "b", "choice": "yes"}],
+        )
+        cleared = {
+            **base,
+            "delegation_events": [
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 1, "delegator": "a", "trustee": None},
+            ],
+        }
+        result = gt.tally_proposal_from_events(cleared)
+        self.assertEqual(result["resolved_delegations"], {"a": "a", "b": "b"})
+        self.assertEqual(result["per_choice"], {"yes": 3, "no": 0})
+
+        delegated = {
+            **base,
+            "delegation_events": [
+                {"block": 1, "delegator": "a", "trustee": None},
+                {"block": 1, "delegator": "a", "trustee": "b"},
+            ],
+        }
+        result = gt.tally_proposal_from_events(delegated)
+        self.assertEqual(result["resolved_delegations"], {"a": "b", "b": "b"})
+        self.assertEqual(result["per_choice"], {"yes": 5, "no": 0})
+
+    def test_equal_blocks_are_not_decreasing(self):
+        data = events_input(
+            delegation_events=[
+                {"block": 5, "delegator": "a", "trustee": "b"},
+                {"block": 5, "delegator": "b", "trustee": "a"},
+            ]
+        )
+        with self.assertRaises(gt.DelegationEventError):
+            gt.tally_proposal_from_events(data)  # 同块顺序合法，但回放后成环
+
+    def test_self_delegation_via_events_is_allowed(self):
+        # 事件级自委托（a -> a）被禁止；但"自委托终止于本人"的语义可经由
+        # 委托后清除达到，此处验证无出边账户受托人即本人（见清除用例）。
+        data = events_input(votes=[{"voter": "a", "choice": "yes"}])
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["per_choice"], {"yes": 10, "no": 0})
+
+    def test_override_semantics_reused_from_events(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegation_events=self.chain_events(),
+            votes=[
+                {"voter": "a", "choice": "no", "delegation_override": True},
+                {"voter": "c", "choice": "yes"},
+            ],
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["effective_weights"], {"a": 2, "c": 7})
+        self.assertEqual(result["per_choice"], {"yes": 7, "no": 2})
+
+    def test_decision_fields_appended_last(self):
+        rules = {
+            "approval_choices": ["yes"],
+            "min_counted_weight": 9,
+            "approval_basis_points": 6000,
+        }
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegation_events=self.chain_events(),
+            votes=[{"voter": "c", "choice": "yes"}],
+            decision_rules=rules,
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(
+            list(result.keys())[-5:],
+            [
+                "snapshot_block",
+                "resolved_delegations",
+                "quorum_met",
+                "approval_met",
+                "decision",
+            ],
+        )
+        self.assertTrue(result["quorum_met"])
+        self.assertEqual(result["decision"], "approved")
+
+    def test_provenance_still_supported(self):
+        data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegation_events=self.chain_events(),
+            votes=[{"voter": "c", "choice": "yes"}],
+            include_provenance=True,
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(
+            result["weight_provenance"], {"c": {"a": 2, "b": 3, "c": 4}}
+        )
+        self.assertEqual(
+            list(result.keys()),
+            [
+                "proposal_id", "per_choice", "effective_weights",
+                "weight_provenance", "uncounted_weight", "counted_weight",
+                "snapshot_total_weight", "winners", "is_tie",
+                "snapshot_block", "resolved_delegations",
+            ],
+        )
+
+
+class DelegationEventErrorTests(unittest.TestCase):
+    def assert_event_error(self, **overrides):
+        with self.assertRaises(gt.DelegationEventError):
+            gt.tally_proposal_from_events(events_input(**overrides))
+
+    def test_missing_top_level_fields(self):
+        for field in (
+            "proposal_id", "choices", "votes", "snapshot",
+            "snapshot_block", "delegation_events",
+        ):
+            data = events_input()
+            del data[field]
+            with self.subTest(field=field):
+                with self.assertRaises(gt.InvalidInputError):
+                    gt.tally_proposal_from_events(data)
+
+    def test_events_not_a_list(self):
+        self.assert_event_error(delegation_events={})
+        self.assert_event_error(delegation_events="nope")
+
+    def test_event_not_an_object(self):
+        self.assert_event_error(delegation_events=[42])
+        self.assert_event_error(delegation_events=[["block"]])
+
+    def test_event_missing_or_extra_field(self):
+        base = {"block": 1, "delegator": "a", "trustee": "b"}
+        for field in ("block", "delegator", "trustee"):
+            event = dict(base)
+            del event[field]
+            self.assert_event_error(delegation_events=[event])
+        event = dict(base)
+        event["extra"] = 1
+        self.assert_event_error(delegation_events=[event])
+
+    def test_block_bad_type_or_negative(self):
+        for block in (True, False, 1.0, "1", None, -1):
+            with self.subTest(block=block):
+                self.assert_event_error(
+                    delegation_events=[
+                        {"block": block, "delegator": "a", "trustee": "b"}
+                    ]
+                )
+
+    def test_block_zero_is_valid(self):
+        data = events_input(
+            snapshot_block=0,
+            delegation_events=[
+                {"block": 0, "delegator": "a", "trustee": "b"}
+            ],
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["resolved_delegations"], {"a": "b", "b": "b"})
+
+    def test_snapshot_block_bad_type_is_invalid_input(self):
+        for value in (True, -1, 1.0, "5", None):
+            with self.subTest(value=value):
+                with self.assertRaises(gt.InvalidInputError):
+                    gt.tally_proposal_from_events(
+                        events_input(snapshot_block=value)
+                    )
+
+    def test_block_decreasing(self):
+        self.assert_event_error(
+            delegation_events=[
+                {"block": 5, "delegator": "a", "trustee": "b"},
+                {"block": 4, "delegator": "b", "trustee": "a"},
+            ]
+        )
+
+    def test_delegator_not_string_or_outside_snapshot(self):
+        self.assert_event_error(
+            delegation_events=[{"block": 1, "delegator": 5, "trustee": "b"}]
+        )
+        self.assert_event_error(
+            delegation_events=[{"block": 1, "delegator": "z", "trustee": "b"}]
+        )
+
+    def test_trustee_bad_type_or_outside_snapshot(self):
+        self.assert_event_error(
+            delegation_events=[{"block": 1, "delegator": "a", "trustee": 5}]
+        )
+        self.assert_event_error(
+            delegation_events=[{"block": 1, "delegator": "a", "trustee": "z"}]
+        )
+
+    def test_trustee_equal_to_delegator(self):
+        self.assert_event_error(
+            delegation_events=[{"block": 1, "delegator": "a", "trustee": "a"}]
+        )
+
+    def test_null_trustee_for_unknown_delegator_is_still_validated(self):
+        # 清除事件的 delegator 仍须在 snapshot 内；trustee 为 null 合法。
+        self.assert_event_error(
+            delegation_events=[{"block": 1, "delegator": "z", "trustee": None}]
+        )
+        data = events_input(
+            delegation_events=[{"block": 1, "delegator": "a", "trustee": None}]
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertEqual(result["resolved_delegations"]["a"], "a")
+
+    def test_cycle_after_replay_raises(self):
+        for events in (
+            [
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "a"},
+            ],
+            [
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "c"},
+                {"block": 3, "delegator": "c", "trustee": "a"},
+            ],
+        ):
+            with self.subTest(events=events):
+                self.assert_event_error(
+                    snapshot={"a": 1, "b": 2, "c": 3},
+                    delegation_events=events,
+                )
+
+    def test_future_events_still_structure_validated(self):
+        # 晚于快照时点的事件无效，但其字段、类型、顺序、账户仍须合法。
+        self.assert_event_error(
+            snapshot_block=1,
+            delegation_events=[
+                {"block": 2, "delegator": "z", "trustee": "b"}
+            ],
+        )
+        self.assert_event_error(
+            snapshot_block=1,
+            delegation_events=[
+                {"block": 5, "delegator": "a", "trustee": "b"},
+                {"block": 4, "delegator": "a", "trustee": None},
+            ],
+        )
+
+    def test_vote_errors_remain_invalid_vote_error(self):
+        # 事件合法但投票非法：沿用 InvalidVoteError，不翻译成事件异常。
+        data = events_input(
+            snapshot={"a": 2, "b": 3},
+            delegation_events=[
+                {"block": 1, "delegator": "a", "trustee": "b"}
+            ],
+            votes=[{"voter": "a", "choice": "yes"}],
+        )
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal_from_events(data)
+        data["votes"] = [{"voter": "z", "choice": "yes"}]
+        with self.assertRaises(gt.InvalidVoteError):
+            gt.tally_proposal_from_events(data)
+
+    def test_decision_rules_errors_remain_invalid_input(self):
+        data = events_input(
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 1,
+                "approval_basis_points": 0,
+            }
+        )
+        with self.assertRaises(gt.InvalidInputError):
+            gt.tally_proposal_from_events(data)
+
+
+class VerifyFromEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.data = events_input(
+            snapshot={"a": 2, "b": 3, "c": 4},
+            delegation_events=[
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "c"},
+            ],
+            votes=[{"voter": "c", "choice": "yes"}],
+        )
+        self.result = gt.tally_proposal_from_events(self.data)
+
+    def test_passes_for_fresh_result(self):
+        self.assertTrue(
+            gt.verify_tally_from_events(self.data, self.result)
+        )
+
+    def test_passes_for_handcrafted_result(self):
+        handcrafted = {
+            "proposal_id": "p1",
+            "per_choice": {"yes": 9, "no": 0},
+            "effective_weights": {"c": 9},
+            "uncounted_weight": 0,
+            "counted_weight": 9,
+            "snapshot_total_weight": 9,
+            "winners": ["yes"],
+            "is_tie": False,
+            "snapshot_block": 100,
+            "resolved_delegations": {"a": "c", "b": "c", "c": "c"},
+        }
+        self.assertTrue(
+            gt.verify_tally_from_events(self.data, handcrafted)
+        )
+
+    def _assert_rejected(self, result):
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally_from_events(self.data, result)
+
+    def test_missing_event_extra_field(self):
+        for field in ("snapshot_block", "resolved_delegations"):
+            bad = json.loads(json.dumps(self.result))
+            del bad[field]
+            self._assert_rejected(bad)
+
+    def test_missing_base_field_still_rejected(self):
+        bad = json.loads(json.dumps(self.result))
+        del bad["winners"]
+        self._assert_rejected(bad)
+
+    def test_snapshot_block_mismatch(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["snapshot_block"] = 99
+        self._assert_rejected(bad)
+
+    def test_snapshot_block_bad_type(self):
+        for value in (True, 100.0, "100", None, -1):
+            bad = json.loads(json.dumps(self.result))
+            bad["snapshot_block"] = value
+            self._assert_rejected(bad)
+
+    def test_resolved_trustee_mismatch(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["resolved_delegations"]["a"] = "b"
+        self._assert_rejected(bad)
+
+    def test_resolved_accounts_order_must_match_snapshot(self):
+        bad = json.loads(json.dumps(self.result))
+        mapping = bad["resolved_delegations"]
+        bad["resolved_delegations"] = {
+            account: mapping[account]
+            for account in ("c", "b", "a")
+        }
+        self._assert_rejected(bad)
+
+    def test_resolved_missing_or_extra_account(self):
+        bad = json.loads(json.dumps(self.result))
+        del bad["resolved_delegations"]["a"]
+        self._assert_rejected(bad)
+        bad = json.loads(json.dumps(self.result))
+        bad["resolved_delegations"]["z"] = "c"
+        self._assert_rejected(bad)
+
+    def test_resolved_not_an_object_or_bad_trustee_type(self):
+        for value in ([], 5, None, {"a": 1}):
+            bad = json.loads(json.dumps(self.result))
+            bad["resolved_delegations"] = value
+            self._assert_rejected(bad)
+
+    def test_fields_wrong_or_extra_order_rejected(self):
+        # snapshot_block 挪到 resolved_delegations 之后：乱序。
+        reordered = {
+            k: v for k, v in self.result.items() if k != "snapshot_block"
+        }
+        reordered["snapshot_block"] = 100
+        self._assert_rejected(reordered)
+        # 多余字段：集合不一致。
+        bad = json.loads(json.dumps(self.result))
+        bad["extra"] = 1
+        self._assert_rejected(bad)
+
+    def test_base_conservation_and_winner_tampering(self):
+        bad = json.loads(json.dumps(self.result))
+        bad["per_choice"]["yes"] = 8
+        self._assert_rejected(bad)
+        bad = json.loads(json.dumps(self.result))
+        bad["winners"] = ["no"]
+        self._assert_rejected(bad)
+
+    def test_invalid_event_input_raises_event_error_not_verification(self):
+        bad_data = json.loads(json.dumps(self.data))
+        bad_data["delegation_events"][0]["block"] = 9
+        with self.assertRaises(gt.DelegationEventError):
+            gt.verify_tally_from_events(bad_data, self.result)
+
+    def test_decision_fields_verified(self):
+        data = events_input(
+            votes=[{"voter": "a", "choice": "yes"}, {"voter": "b", "choice": "no"}],
+            decision_rules={
+                "approval_choices": ["yes"],
+                "min_counted_weight": 15,
+                "approval_basis_points": 6000,
+            },
+        )
+        result = gt.tally_proposal_from_events(data)
+        self.assertTrue(gt.verify_tally_from_events(data, result))
+        bad = json.loads(json.dumps(result))
+        bad["decision"] = "rejected"
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally_from_events(data, bad)
+        bad = json.loads(json.dumps(result))
+        del bad["approval_met"]
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally_from_events(data, bad)
+        # 无配置时结果含门槛字段应失败。
+        plain = events_input(
+            votes=[{"voter": "a", "choice": "yes"}]
+        )
+        plain_result = gt.tally_proposal_from_events(plain)
+        self.assertTrue(gt.verify_tally_from_events(plain, plain_result))
+        tampered = json.loads(json.dumps(plain_result))
+        tampered["quorum_met"] = True
+        with self.assertRaises(gt.TallyVerificationError):
+            gt.verify_tally_from_events(plain, tampered)
+
+
+class ReviewPackageFromEventsTests(unittest.TestCase):
+    EVENTS = [
+        {"block": 1, "delegator": "a", "trustee": "b"},
+        {"block": 2, "delegator": "b", "trustee": "c"},
+        {"block": 3, "delegator": "d", "trustee": "c"},
+    ]
+    SNAPSHOT = {"a": 2, "b": 3, "c": 4, "d": 5, "e": 7}
+
+    def build(self, claimed_result, **overrides):
+        kwargs = dict(
+            proposal_id="p1",
+            snapshot_block=42,
+            snapshot=self.SNAPSHOT,
+            votes=[{"voter": "c", "choice": "yes"}],
+            delegation_events=self.EVENTS,
+        )
+        kwargs.update(overrides)
+        return gt.build_review_package_from_events(
+            claimed_result=claimed_result, **kwargs
+        )
+
+    def claimed(self, **overrides):
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"yes": 14},
+            "direct_participated_weight": 4,
+            "delegated_weight": 10,
+            "non_participated_weight": 7,
+            "resolved_delegations": {
+                "a": "c", "b": "c", "c": "c", "d": "c", "e": "e",
+            },
+        }
+        claim.update(overrides)
+        return claim
+
+    def test_matched_package_and_field_order(self):
+        pkg = self.build(self.claimed())
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["field_differences"], [])
+        self.assertTrue(pkg["weight_conservation_holds"])
+        self.assertEqual(pkg["results_by_choice"], {"yes": 14})
+        self.assertEqual(
+            list(pkg.keys()),
+            [
+                "proposal_id",
+                "snapshot_block",
+                "results_by_choice",
+                "direct_participated_weight",
+                "delegated_weight",
+                "non_participated_weight",
+                "effective_delegations",
+                "weight_conservation_holds",
+                "review_status",
+                "field_differences",
+                "resolved_delegations",
+            ],
+        )
+        self.assertEqual(
+            pkg["resolved_delegations"],
+            {"a": "c", "b": "c", "c": "c", "d": "c", "e": "e"},
+        )
+        self.assertEqual(
+            pkg["effective_delegations"],
+            [
+                {"delegator": "a", "trustee": "c", "weight": 2},
+                {"delegator": "b", "trustee": "c", "weight": 3},
+                {"delegator": "d", "trustee": "c", "weight": 5},
+            ],
+        )
+
+    def test_snapshot_cutoff_changes_effective_state(self):
+        # block 3 的 d->c 晚于快照时点：d 保留为未参与，resolved 中 d 为本人。
+        claim = self.claimed(
+            snapshot_block=2,
+            results_by_choice={"yes": 9},
+            direct_participated_weight=4,
+            delegated_weight=5,
+            non_participated_weight=12,
+            resolved_delegations={
+                "a": "c", "b": "c", "c": "c", "d": "d", "e": "e",
+            },
+        )
+        pkg = self.build(claim, snapshot_block=2)
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["delegated_weight"], 5)
+        self.assertEqual(pkg["non_participated_weight"], 12)
+
+    def test_resolved_mismatch_reports_difference(self):
+        claim = self.claimed(
+            resolved_delegations={
+                "a": "b", "b": "c", "c": "c", "d": "c", "e": "e",
+            }
+        )
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "mismatched")
+        self.assertEqual(
+            [d["field"] for d in pkg["field_differences"]],
+            ["resolved_delegations"],
+        )
+        diff = pkg["field_differences"][0]
+        self.assertEqual(diff["claimed"]["a"], "b")
+        self.assertEqual(diff["computed"]["a"], "c")
+
+    def test_resolved_order_normalized_in_difference(self):
+        # 待核对映射反序给出，语义一致时仍 matched（与 results_by_choice 相同）。
+        claim = self.claimed(
+            resolved_delegations={
+                "e": "e", "d": "c", "c": "c", "b": "c", "a": "c",
+            }
+        )
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "matched")
+
+    def test_missing_resolved_is_a_difference(self):
+        claim = self.claimed()
+        del claim["resolved_delegations"]
+        pkg = self.build(claim)
+        self.assertEqual(pkg["review_status"], "mismatched")
+        diff = next(
+            d for d in pkg["field_differences"]
+            if d["field"] == "resolved_delegations"
+        )
+        self.assertIsNone(diff["claimed"])
+        self.assertEqual(
+            diff["computed"],
+            {"a": "c", "b": "c", "c": "c", "d": "c", "e": "e"},
+        )
+
+    def test_unknown_claimed_field_still_raises(self):
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build({"bogus": 1})
+        # resolved_delegations 不是对象：结构契约错误。
+        with self.assertRaises(gt.ClaimedResultValidationError):
+            self.build(self.claimed(resolved_delegations=[]))
+
+    def test_decision_fields_appended_after_resolved(self):
+        rules = {
+            "approval_choices": ["yes"],
+            "min_counted_weight": 9,
+            "approval_basis_points": 6000,
+        }
+        claim = self.claimed(
+            results_by_choice={"no": 0, "yes": 14},
+            quorum_met=True,
+            approval_met=True,
+            decision="approved",
+        )
+        pkg = self.build(
+            claim,
+            choices=["yes", "no"],
+            decision_rules=rules,
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(
+            list(pkg.keys())[-4:],
+            ["resolved_delegations", "quorum_met", "approval_met", "decision"],
+        )
+
+    def test_choices_zero_choices_listed(self):
+        claim = self.claimed(
+            results_by_choice={"no": 0, "yes": 14},
+        )
+        pkg = self.build(claim, choices=["yes", "no"])
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertEqual(pkg["results_by_choice"], {"no": 0, "yes": 14})
+
+    def test_override_weights_classified(self):
+        events = [
+            {"block": 1, "delegator": "a", "trustee": "b"},
+            {"block": 2, "delegator": "b", "trustee": "c"},
+        ]
+        votes = [
+            {"voter": "b", "choice": "no", "delegation_override": True},
+            {"voter": "c", "choice": "yes"},
+        ]
+        claim = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "results_by_choice": {"no": 3, "yes": 6},
+            "direct_participated_weight": 7,
+            "delegated_weight": 2,
+            "non_participated_weight": 0,
+            "resolved_delegations": {"a": "c", "b": "c", "c": "c"},
+        }
+        pkg = gt.build_review_package_from_events(
+            "p1", 42, {"a": 2, "b": 3, "c": 4},
+            votes, events, claim,
+        )
+        self.assertEqual(pkg["review_status"], "matched")
+        self.assertTrue(pkg["weight_conservation_holds"])
+        self.assertEqual(
+            pkg["effective_delegations"],
+            [{"delegator": "a", "trustee": "c", "weight": 2}],
+        )
+
+    def test_event_errors_translate_to_delegation_event_error(self):
+        cases = [
+            dict(delegation_events="nope"),
+            dict(delegation_events=[{"block": 1, "delegator": "a", "trustee": "a"}]),
+            dict(delegation_events=[
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "a"},
+            ]),
+            dict(snapshot_block=-1),
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(
+                    (gt.DelegationEventError, gt.SnapshotIntegrityError)
+                ):
+                    self.build({}, **overrides)
+
+    def test_ballot_errors_remain_ballot_validation_error(self):
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                {},
+                votes=[{"voter": "z", "choice": "yes"}],
+            )
+        # 已委托者投普通票：回放结果下仍是 BallotValidationError。
+        with self.assertRaises(gt.BallotValidationError):
+            self.build(
+                {},
+                snapshot={"a": 2, "b": 3, "c": 4},
+                votes=[{"voter": "a", "choice": "yes"}],
+                delegation_events=[
+                    {"block": 1, "delegator": "a", "trustee": "b"},
+                    {"block": 2, "delegator": "b", "trustee": "c"},
+                ],
+            )
+
+
+class CliEventsTests(unittest.TestCase):
+    def run_cli(self, payload, args=("events",)):
+        proc = subprocess.run(
+            [sys.executable, str(MODULE), *args],
+            input=payload if isinstance(payload, str) else json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, json.loads(proc.stdout), proc.stderr
+
+    def payload(self, **overrides):
+        data = {
+            "proposal_id": "p1",
+            "choices": ["yes", "no"],
+            "votes": [{"voter": "c", "choice": "yes"}],
+            "snapshot": {"a": 2, "b": 3, "c": 4},
+            "snapshot_block": 10,
+            "delegation_events": [
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "c"},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def test_events_success_exit_zero(self):
+        code, out, err = self.run_cli(self.payload())
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["per_choice"], {"yes": 9, "no": 0})
+        self.assertEqual(
+            out["resolved_delegations"], {"a": "c", "b": "c", "c": "c"}
+        )
+        self.assertEqual(out["snapshot_block"], 10)
+        self.assertEqual(
+            list(out.keys())[-2:], ["snapshot_block", "resolved_delegations"]
+        )
+
+    def test_events_includes_provenance_flag(self):
+        code, out, err = self.run_cli(self.payload(include_provenance=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out["weight_provenance"], {"c": {"a": 2, "b": 3, "c": 4}}
+        )
+
+    def test_events_delegation_error_exit_two(self):
+        payload = self.payload()
+        payload["delegation_events"][1]["block"] = 0
+        code, out, err = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "")
+        self.assertEqual(out["error"], "DelegationEventError")
+        self.assertIsInstance(out["message"], str)
+        self.assertNotIn("0x", out["message"])
+
+    def test_events_missing_and_extra_top_level(self):
+        payload = self.payload()
+        del payload["delegation_events"]
+        code, out, _ = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+        payload = self.payload()
+        payload["delegations"] = {}
+        code, out, _ = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+        payload = self.payload()
+        payload["bogus"] = 1
+        code, out, _ = self.run_cli(payload)
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_events_invalid_json(self):
+        code, out, _ = self.run_cli("{not json")
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_review_events_success(self):
+        payload = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 2, "b": 3, "c": 4},
+            "votes": [{"voter": "c", "choice": "yes"}],
+            "delegation_events": [
+                {"block": 1, "delegator": "a", "trustee": "b"},
+                {"block": 2, "delegator": "b", "trustee": "c"},
+            ],
+            "claimed_result": {
+                "proposal_id": "p1",
+                "snapshot_block": 42,
+                "results_by_choice": {"yes": 9},
+                "direct_participated_weight": 4,
+                "delegated_weight": 5,
+                "non_participated_weight": 0,
+                "resolved_delegations": {"a": "c", "b": "c", "c": "c"},
+            },
+        }
+        code, out, err = self.run_cli(payload, args=("review-events",))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out["review_status"], "matched")
+        self.assertEqual(
+            list(out.keys())[-1], "resolved_delegations"
+        )
+
+    def test_review_events_mismatched_still_exit_zero(self):
+        payload = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 1, "b": 2},
+            "votes": [],
+            "delegation_events": [],
+            "claimed_result": {},
+        }
+        code, out, err = self.run_cli(payload, args=("review-events",))
+        self.assertEqual(code, 0)
+        self.assertEqual(out["review_status"], "mismatched")
+        self.assertIn(
+            "resolved_delegations",
+            [d["field"] for d in out["field_differences"]],
+        )
+
+    def test_review_events_error_classes(self):
+        base = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 1, "b": 2},
+            "votes": [],
+            "delegation_events": [],
+            "claimed_result": {},
+        }
+        cases = [
+            (dict(base, snapshot_block=True), "SnapshotIntegrityError"),
+            (dict(base, delegation_events=[
+                {"block": 1, "delegator": "a", "trustee": "a"}
+            ]), "DelegationEventError"),
+            (dict(base, claimed_result={"bogus": 1}),
+             "ClaimedResultValidationError"),
+        ]
+        for payload, name in cases:
+            with self.subTest(name=name):
+                code, out, err = self.run_cli(payload, args=("review-events",))
+                self.assertEqual(code, 2)
+                self.assertEqual(err, "")
+                self.assertEqual(out["error"], name)
+
+    def test_review_events_missing_and_extra_fields(self):
+        payload = {
+            "proposal_id": "p1",
+            "snapshot_block": 1,
+            "snapshot": {"a": 1},
+            "votes": [],
+            "claimed_result": {},
+        }
+        code, out, _ = self.run_cli(payload, args=("review-events",))
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+        payload["delegation_events"] = []
+        payload["delegations"] = {}
+        code, out, _ = self.run_cli(payload, args=("review-events",))
+        self.assertEqual(code, 2)
+        self.assertEqual(out["error"], "InvalidInputError")
+
+    def test_legacy_commands_unchanged(self):
+        # 无参数仍走静态 delegations 输入：无 delegations 报缺失，
+        # 传入 delegation_events 不被识别。
+        payload = base_input(
+            votes=[
+                {"voter": "a", "choice": "yes"},
+                {"voter": "b", "choice": "no"},
+            ]
+        )
+        code, out, err = self.run_cli(payload, args=())
+        self.assertEqual(code, 0)
+        self.assertEqual(out["per_choice"], {"yes": 10, "no": 5})
+        self.assertNotIn("resolved_delegations", out)
+
+        legacy_review = {
+            "proposal_id": "p1",
+            "snapshot_block": 42,
+            "snapshot": {"a": 1},
+            "votes": [],
+            "delegations": {},
+            "claimed_result": {},
+        }
+        code, out, _ = self.run_cli(legacy_review, args=("review",))
+        self.assertEqual(code, 0)
+        self.assertNotIn("resolved_delegations", out)
+
+
 if __name__ == "__main__":
     unittest.main()

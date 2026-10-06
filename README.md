@@ -15,6 +15,9 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 已实现：快照权重、逐跳委托解析、受托人权重合并、提案级委托覆盖投票、计票、独立复核、
 可选权重来源追踪（`include_provenance`）、可选门槛判定（`decision_rules`）与 CLI；
 结果复核（review）同样独立核对覆盖票归属、完整选项（`choices`）与门槛判定。
+此外提供委托事件流入口：按 `delegation_events` 重建指定 `snapshot_block` 时点的
+委托状态再计票（`tally_proposal_from_events` / `verify_tally_from_events` /
+`build_review_package_from_events` 与 `events` / `review-events` 命令）。
 
 ## 安装与运行
 
@@ -23,12 +26,15 @@ DAO 治理投票计票引擎：投票快照、委托计算与结果复核。
 ```bash
 cat proposal.json | python3 gov_tally.py
 cat review_input.json | python3 gov_tally.py review
+cat proposal_events.json | python3 gov_tally.py events
+cat review_events_input.json | python3 gov_tally.py review-events
 ```
 
 - 成功：退出码 `0`，标准输出为结果 JSON。
 - 失败：退出码 `2`，标准输出为 `{"error": 异常类名, "message": 稳定描述}`，不输出 traceback。
-- 无参数：按提案计票输入处理；`review` 子命令：按复核包输入处理（见下文「结果复核」），
-  只新增输入输出路径，计票语义、异常与退出码不变。
+- 无参数：按提案计票输入处理；`review` 子命令：按复核包输入处理（见下文「结果复核」）；
+  `events` / `review-events`：按委托事件流输入处理（见下文「委托事件流」）。
+  新命令只新增输入输出路径，旧入口的字段顺序、异常、结果与退出码不变。
 
 ## 输入格式
 
@@ -214,6 +220,72 @@ Python API 对应
 `build_review_package(proposal_id, snapshot_block, snapshot, votes, delegations,
 claimed_result, choices=None, decision_rules=None)`。
 
+## 委托事件流（events / review-events）
+
+事件流入口按委托事件序列重建指定快照时点的委托状态，再沿用完全相同的
+计票语义：
+
+```bash
+cat proposal_events.json | python3 gov_tally.py events
+cat review_events_input.json | python3 gov_tally.py review-events
+```
+
+`events` 的输入沿用提案字段（`proposal_id` / `choices` / `votes` /
+`snapshot` / 可选 `include_provenance` / 可选 `decision_rules`），但以
+`snapshot_block` 与 `delegation_events` 取代 `delegations`；顶层不得再含
+`delegations`（缺必填字段或多未知字段报 `InvalidInputError`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `snapshot_block` | int | 非负整数快照区块（布尔值不算整数） |
+| `delegation_events` | object[] | 委托事件列表，每项恰好含 `block`、`delegator`、`trustee` |
+
+事件回放规则：
+
+- 每个事件恰好含 `block`（非负整数，布尔值不算整数）、`delegator`（string）、
+  `trustee`（string 或 null）三个字段；字段缺失或多余、事件不是对象、
+  `delegation_events` 不是列表均报 `DelegationEventError`。
+- 事件按序生效：`block` 不得递减（相等合法）；同一块内后项覆盖前项；
+  `trustee` 为 `null` 表示清除该委托方当前委托。
+- `delegator` 与非 null 的 `trustee` 都必须在 `snapshot` 内；非 null 的
+  `trustee` 不得等于 `delegator`（事件级自委托非法）。
+- 仅 `block <= snapshot_block` 的事件参与状态折叠，取每个委托方在快照时点
+  的最后状态；更晚的事件无效，但其字段、类型、顺序与账户仍须合法。
+- 折叠完成后逐跳解析最终受托人；回放后委托链成环报 `DelegationEventError`
+  （仅由更晚事件构成、快照时点不生效的环不报错）。
+
+回放后的计票完全沿用静态入口：逐跳解析、自委托终止于本人、覆盖扣减、
+权重合并、`include_provenance` 来源追踪与 `decision_rules` 门槛判定；
+投票非法仍报 `InvalidVoteError`，门槛非法仍报 `InvalidInputError`。
+
+`events` 的输出字段与静态计票一致，在 `is_tie` 之后追加：
+
+| 字段 | 说明 |
+| --- | --- |
+| `snapshot_block` | 与输入一致的快照区块 |
+| `resolved_delegations` | 按 `snapshot` 键顺序列出各账户在快照时点的最终受托人（无委托者为本人） |
+
+有 `decision_rules` 时三个门槛字段仍追加在最后；启用 `include_provenance`
+时 `weight_provenance` 位置不变。
+
+`verify_tally_from_events(input_data, result)` 独立重放事件并重算，复核
+全部基础字段、三类权重守恒、赢家、并列、来源（启用时）与门槛，并复核尾部的
+`snapshot_block` 与 `resolved_delegations`（存在性、尾部位置、snapshot 顺序
+与最终受托人）；字段缺失、乱序、多余或数值不符均抛 `TallyVerificationError`。
+
+`review-events` 的输入沿用 `review` 的复核字段与 `claimed_result`，委托改用
+`snapshot_block` + `delegation_events`（顶层不得含 `delegations`）。输出保持
+静态复核包的字段顺序，在 `field_differences` 之后追加 `resolved_delegations`；
+`claimed_result` 允许的字段集合同样在末尾加入 `resolved_delegations`（其为
+account -> trustee 对象，比对前按键名归一化排序），有 `decision_rules` 时
+三个门槛字段仍在最后。三类权重守恒与逐项差异（含 resolved 不一致、缺失）
+规则不变。事件非法报 `DelegationEventError`，其余异常分类与 `review` 一致
+（快照 `SnapshotIntegrityError`、选票 `BallotValidationError`、待核对结果
+`ClaimedResultValidationError`、顶层/`choices`/`decision_rules`
+`InvalidInputError`）。Python API 对应
+`build_review_package_from_events(proposal_id, snapshot_block, snapshot, votes,
+delegation_events, claimed_result, choices=None, decision_rules=None)`。
+
 ## Python API
 
 ```python
@@ -225,6 +297,14 @@ verify_tally(input_data, result)  # 一致返回 True，否则抛 TallyVerificat
 # 可选权重来源追踪：参数与输入字段二选一（参数优先）
 result = tally_proposal(input_data, include_provenance=True)
 verify_tally(input_data, result, include_provenance=True)
+
+# 委托事件流：以 snapshot_block + delegation_events 取代 delegations
+result = tally_proposal_from_events(events_input)
+verify_tally_from_events(events_input, result)
+package = build_review_package_from_events(
+    proposal_id, snapshot_block, snapshot, votes,
+    delegation_events, claimed_result,
+)
 ```
 
 `verify_tally` 按覆盖语义独立重算并逐字段复核：字段完整性、`per_choice` 选项与顺序、
@@ -239,6 +319,10 @@ verify_tally(input_data, result, include_provenance=True)
 来源至多归属一张计票；缺失、额外、乱序、错配、重复归属、非整数或非正来源权重均抛
 `TallyVerificationError`。为 `false` 时结果中的额外字段不受约束。
 
+`verify_tally_from_events` 在此之外独立重放事件，并严格复核结果尾部的
+`snapshot_block` 与 `resolved_delegations`；事件流结果的字段集合与顺序必须
+与重算结果完全一致，缺失、乱序、多余或数值不符都抛 `TallyVerificationError`。
+
 ## 异常
 
 | 异常类 | 触发条件 |
@@ -247,7 +331,8 @@ verify_tally(input_data, result, include_provenance=True)
 | `InvalidDelegationError` | `delegations` 的委托方或受托方不在 `snapshot` 中 |
 | `DelegationCycleError` | 委托链成环且无法到达最终受托人 |
 | `InvalidVoteError` | voter 重复、普通票来自已委托他人者、覆盖票来自未委托他人者、voter 不在 snapshot、choice 不在 choices |
-| `TallyVerificationError` | `verify_tally` 复核不一致 |
+| `DelegationEventError` | 委托事件流非法：事件不是对象、字段缺失或多余，`block` 不是非负整数或顺序递减，`delegator`/`trustee` 不是字符串或不在 snapshot，非 null `trustee` 等于 `delegator`，或回放至快照时点后委托链成环（事件流入口） |
+| `TallyVerificationError` | `verify_tally` / `verify_tally_from_events` 复核不一致 |
 
 错误输出中的 `message` 为确定性文本，不含内存地址。
 
